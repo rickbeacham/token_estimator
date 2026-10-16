@@ -3,11 +3,15 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+
+/// Top-level OpenRouter API endpoint constructed via [Uri.https] to guarantee
+/// valid host/path resolution and prevent markdown auto-linker corruption.
+final Uri kOpenRouterModelsUri = Uri.https('openrouter.ai', '/api/v1/models');
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -328,7 +332,7 @@ const List<ModelPricing> kDefaultModelCatalog = [
     outputAboveThresholdPer1M: 22.50,
     cacheWritePer1M: 3.75, // +25% cache write penalty on Turn 1
     cacheReadPer1M: 0.30, // 90% discount on cache read
-    tokensPerImage: 1600, // Claude ~1600 tokens per 1080p image
+    tokensPerImage: 1600,
     tokensPerPdfPage: 1500,
     tokensPerMediaMinute: 18000,
   ),
@@ -347,7 +351,7 @@ const List<ModelPricing> kDefaultModelCatalog = [
     outputAboveThresholdPer1M: 20.00,
     cacheWritePer1M: 2.50,
     cacheReadPer1M: 1.25, // 50% discount on cached prefix
-    tokensPerImage: 765, // High-detail tile average
+    tokensPerImage: 765,
     tokensPerPdfPage: 1100,
     tokensPerMediaMinute: 12000,
   ),
@@ -380,7 +384,11 @@ class TurnBreakdown {
   final int turnNumber;
   final int totalContextTokens;
   final int uncachedInputTokens;
+
+  /// Populated on Turn 1 only when context caching is active (0 on Turn 2..N).
   final int cacheWriteTokens;
+
+  /// Populated on Turn 2..N when reading from the cached prefix (0 on Turn 1).
   final int cacheReadTokens;
   final int outputTokens;
   final int reasoningTokens;
@@ -408,7 +416,7 @@ class SimulationBreakdown {
   final int initialPromptTokens;
   final int peakTurnContextTokens;
   final int totalBilledInputTokens; // Strictly uncached input tokens
-  final int totalCacheWriteTokens; // Dedicated Turn-1 cache write tokens (Fix 1.3)
+  final int totalCacheWriteTokens; // Turn-1 only cache write tokens
   final int totalCachedReadTokens; // Turn 2..N cache read tokens
   final int totalVisibleOutputTokens;
   final int totalReasoningTokens;
@@ -452,9 +460,10 @@ class SimulationBreakdown {
     required this.turns,
   });
 
-  /// Positive = Cache Saved X% of input cost.
-  /// Negative = Cache Penalty -X% (Turn-1 write surcharge exceeded Turn 2..N savings).
-  double get cacheSavingsPercent {
+  /// Signed input-cost impact of context caching:
+  /// - Positive (+X%) = Cache saved X% of uncached input baseline cost.
+  /// - Negative (-X%) = Cache penalty increased input cost by X% (e.g. 1-turn write surcharge).
+  double get cacheImpactPercent {
     if (uncachedInputBaselineCost <= 0) return 0.0;
     final actualInputCost = uncachedInputCost + cacheWriteCost + cacheReadCost;
     final diff = uncachedInputBaselineCost - actualInputCost;
@@ -490,21 +499,28 @@ class TokenizerEngine {
   static final LinkedHashMap<String, int> _countCache =
       LinkedHashMap<String, int>();
 
+  /// Clears the static token count LRU cache (useful for isolated widget/unit tests).
+  @visibleForTesting
+  static void clearCache() => _countCache.clear();
+
   /// Unicode-aware regex handling:
   /// 1: Whitespace runs
   /// 2: Numeric literals
   /// 3: Multi-char code operators & markdown fences
   /// 4: ASCII & Latin/Cyrillic identifiers
   /// 5: CJK ideographs & Hangul syllables
-  /// 6: Emoji / surrogate / astral plane symbols
-  /// 7: Single-char punctuation fallback
+  /// 6: Complete Emoji clusters (Regional Indicator pairs, ZWJ sequences,
+  ///    skin-tone modifiers \u{1F3FB}-\u{1F3FF}, and variation selectors \uFE0F)
+  /// 7: Standalone zero-width joiners / variation selectors (weight 0)
+  /// 8: Single-char punctuation fallback
   static final RegExp _tokenRegex = RegExp(
     r'(\s+)'
     r'|([0-9]+(?:\.[0-9]+)?)'
     r'|(```|===|!==|>>>|<<|>>|->|=>|::|\|\||&&|<=|>=|==|!=|\+\+|--)'
     r'|([A-Za-z_\u00C0-\u024F\u0400-\u04FF][A-Za-z0-9_\u00C0-\u024F\u0400-\u04FF]*)'
     r'|([\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF])'
-    r'|([\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}])'
+    r'|([\u{1F1E6}-\u{1F1FF}]{2}|(?:[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}][\u{1F3FB}-\u{1F3FF}\uFE0F]?(?:\u200D[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}][\u{1F3FB}-\u{1F3FF}\uFE0F]?)*))'
+    r'|([\u200D\uFE0F]+)'
     r'|([^\sA-Za-z0-9_])',
     unicode: true,
   );
@@ -515,7 +531,7 @@ class TokenizerEngine {
   }
 
   /// Content-aware subword tokenizer that handles multi-char operators,
-  /// Cyrillic/CJK scripts, and emoji BPE multipliers.
+  /// Cyrillic/CJK scripts, and grouped ZWJ/flag emoji sequences.
   static List<TokenSpanItem> tokenizeToSpans(
     String rawText, {
     double charsPerToken = 3.8,
@@ -547,12 +563,11 @@ class TokenizerEngine {
           ));
         }
       } else if (m.group(3) != null) {
-        // Grouped multi-char operator or code fence = 1 token
         spans.add(TokenSpanItem(full, TokenKind.codePunct));
       } else if (m.group(4) != null) {
-        // Cyrillic / non-ASCII words split slightly denser in BPE
         final bool isNonAscii = full.codeUnits.any((c) => c > 127);
-        final int step = isNonAscii ? math.max(2, subwordChunk - 1) : subwordChunk;
+        final int step =
+            isNonAscii ? math.max(2, subwordChunk - 1) : subwordChunk;
         if (full.length <= step + 2) {
           spans.add(TokenSpanItem(full, TokenKind.word));
         } else {
@@ -564,11 +579,17 @@ class TokenizerEngine {
           }
         }
       } else if (m.group(5) != null) {
-        // CJK character (~1.5 BPE tokens on average; alternate 1 and 2)
+        // CJK character (~1.5-2 BPE tokens)
         spans.add(TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: 2));
       } else if (m.group(6) != null) {
-        // Emoji / astral symbol (~3 BPE tokens per emoji)
-        spans.add(TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: 3));
+        // Complete Emoji or ZWJ/Flag cluster: 3 tokens for single/flag, 4 for composite ZWJ
+        final int weight = full.contains('\u200D') ? 4 : 3;
+        spans.add(
+          TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: weight),
+        );
+      } else if (m.group(7) != null) {
+        // Stray zero-width joiners or variation selectors carry 0 standalone token weight
+        continue;
       } else {
         spans.add(TokenSpanItem(full, TokenKind.codePunct));
       }
@@ -611,6 +632,194 @@ class TokenizerEngine {
     _countCache[cacheKey] = result;
     return result;
   }
+
+  /// Standalone simulation runner so unit tests can verify simulation math
+  /// without instantiating the widget tree.
+  static SimulationBreakdown runSimulation({
+    required ModelPricing model,
+    required String systemText,
+    required String userText,
+    required ExecutionMode mode,
+    required ReasoningPreset reasoningEffort,
+    required int agentSteps,
+    required int toolPayloadTokensPerStep,
+    required int visibleOutputTokensPerStep,
+    required bool contextCachingEnabled,
+    int imageCount = 0,
+    int pdfPageCount = 0,
+    int mediaMinutes = 0,
+  }) {
+    final bool truncated =
+        systemText.length > maxInputChars || userText.length > maxInputChars;
+
+    final int sysTokens = estimateTokenCount(
+      systemText,
+      charsPerToken: model.charsPerToken,
+    );
+    final int usrTokens = estimateTokenCount(
+      userText,
+      charsPerToken: model.charsPerToken,
+    );
+
+    final int imageTokens = imageCount * model.tokensPerImage;
+    final int pdfTokens = pdfPageCount * model.tokensPerPdfPage;
+    final int mediaTokens = mediaMinutes * model.tokensPerMediaMinute;
+    final int multiTokens = imageTokens + pdfTokens + mediaTokens;
+
+    final int initialPromptTokens = sysTokens + usrTokens + multiTokens;
+    final int steps = mode == ExecutionMode.chat ? 1 : agentSteps;
+    final int toolStepTokens =
+        mode == ExecutionMode.chat ? 0 : toolPayloadTokensPerStep;
+    final int outPerStep = visibleOutputTokensPerStep;
+    final int thinkPerStep = reasoningEffort.tokenBudget;
+
+    final int cacheablePrefixTokens = sysTokens + multiTokens;
+
+    int totalUncachedInputTokens = 0;
+    int totalCacheWriteTokens = 0;
+    int totalCacheReadTokens = 0;
+    int peakContextTokens = 0;
+    bool crossedLongContext = false;
+
+    double uncachedInputCost = 0.0;
+    double cacheWriteCost = 0.0;
+    double cacheReadCost = 0.0;
+    double visibleOutputCost = 0.0;
+    double reasoningOutputCost = 0.0;
+    double uncachedBaselineCost = 0.0;
+    double uncachedInputBaselineCost = 0.0;
+
+    int rollingHistoryTokens = usrTokens;
+    final List<TurnBreakdown> turnLog = [];
+
+    for (int turn = 1; turn <= steps; turn++) {
+      final int turnTotalContext = cacheablePrefixTokens + rollingHistoryTokens;
+      if (turnTotalContext > peakContextTokens) {
+        peakContextTokens = turnTotalContext;
+      }
+
+      final bool isLongContextTurn =
+          model.longContextThreshold < model.contextWindow &&
+          turnTotalContext > model.longContextThreshold;
+      if (isLongContextTurn) crossedLongContext = true;
+
+      final double activeInRate = isLongContextTurn
+          ? model.inputAboveThresholdPer1M
+          : model.inputPer1M;
+      final double activeOutRate = isLongContextTurn
+          ? model.outputAboveThresholdPer1M
+          : model.outputPer1M;
+      final double activeReasonRate = isLongContextTurn
+          ? math.max(
+              model.reasoningOutputPer1M,
+              model.outputAboveThresholdPer1M,
+            )
+          : model.reasoningOutputPer1M;
+
+      final double turnUncachedInputBaseline =
+          (turnTotalContext / 1000000.0) * activeInRate;
+      final double turnOutCost = (outPerStep / 1000000.0) * activeOutRate;
+      final double turnReasonCost =
+          (thinkPerStep / 1000000.0) * activeReasonRate;
+
+      uncachedInputBaselineCost += turnUncachedInputBaseline;
+      uncachedBaselineCost +=
+          turnUncachedInputBaseline + turnOutCost + turnReasonCost;
+
+      int turnUncachedTok = 0;
+      int turnCacheWriteTok = 0;
+      int turnCacheReadTok = 0;
+      double turnInputCost = 0.0;
+
+      if (contextCachingEnabled &&
+          mode == ExecutionMode.agent &&
+          cacheablePrefixTokens > 0) {
+        if (turn == 1) {
+          final double writeCost =
+              (cacheablePrefixTokens / 1000000.0) * model.cacheWritePer1M;
+          final double dynCost =
+              (rollingHistoryTokens / 1000000.0) * activeInRate;
+          cacheWriteCost += writeCost;
+          uncachedInputCost += dynCost;
+          turnInputCost = writeCost + dynCost;
+
+          turnCacheWriteTok = cacheablePrefixTokens;
+          turnUncachedTok = rollingHistoryTokens;
+          totalCacheWriteTokens += cacheablePrefixTokens;
+          totalUncachedInputTokens += rollingHistoryTokens;
+        } else {
+          final double readCost =
+              (cacheablePrefixTokens / 1000000.0) * model.cacheReadPer1M;
+          final double dynCost =
+              (rollingHistoryTokens / 1000000.0) * activeInRate;
+          cacheReadCost += readCost;
+          uncachedInputCost += dynCost;
+          turnInputCost = readCost + dynCost;
+
+          turnCacheReadTok = cacheablePrefixTokens;
+          turnUncachedTok = rollingHistoryTokens;
+          totalCacheReadTokens += cacheablePrefixTokens;
+          totalUncachedInputTokens += rollingHistoryTokens;
+        }
+      } else {
+        turnInputCost = turnUncachedInputBaseline;
+        uncachedInputCost += turnInputCost;
+        turnUncachedTok = turnTotalContext;
+        totalUncachedInputTokens += turnTotalContext;
+      }
+
+      visibleOutputCost += turnOutCost;
+      reasoningOutputCost += turnReasonCost;
+
+      turnLog.add(
+        TurnBreakdown(
+          turnNumber: turn,
+          totalContextTokens: turnTotalContext,
+          uncachedInputTokens: turnUncachedTok,
+          cacheWriteTokens: turnCacheWriteTok,
+          cacheReadTokens: turnCacheReadTok,
+          outputTokens: outPerStep,
+          reasoningTokens: thinkPerStep,
+          turnCost: turnInputCost + turnOutCost + turnReasonCost,
+          isLongContextTier: isLongContextTurn,
+        ),
+      );
+
+      rollingHistoryTokens += outPerStep + toolStepTokens;
+    }
+
+    final double totalCostSingleRun = uncachedInputCost +
+        cacheWriteCost +
+        cacheReadCost +
+        visibleOutputCost +
+        reasoningOutputCost;
+
+    return SimulationBreakdown(
+      model: model,
+      systemTextTokens: sysTokens,
+      userTextTokens: usrTokens,
+      multimodalTokens: multiTokens,
+      initialPromptTokens: initialPromptTokens,
+      peakTurnContextTokens: peakContextTokens,
+      totalBilledInputTokens: totalUncachedInputTokens,
+      totalCacheWriteTokens: totalCacheWriteTokens,
+      totalCachedReadTokens: totalCacheReadTokens,
+      totalVisibleOutputTokens: outPerStep * steps,
+      totalReasoningTokens: thinkPerStep * steps,
+      exceedsContextWindow: peakContextTokens > model.contextWindow,
+      crossedLongContextTier: crossedLongContext,
+      textWasTruncated: truncated,
+      uncachedInputCost: uncachedInputCost,
+      cacheWriteCost: cacheWriteCost,
+      cacheReadCost: cacheReadCost,
+      visibleOutputCost: visibleOutputCost,
+      reasoningOutputCost: reasoningOutputCost,
+      totalCostSingleRun: totalCostSingleRun,
+      uncachedBaselineCost: uncachedBaselineCost,
+      uncachedInputBaselineCost: uncachedInputBaselineCost,
+      turns: turnLog,
+    );
+  }
 }
 
 // ============================================================================
@@ -636,7 +845,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   late final TextEditingController _userPromptCtrl;
   Timer? _debounceTimer;
 
-  // Track last trimmed text to skip no-op whitespace rebuilds
+  // Track last committed text to skip no-op rebuilds when text is unchanged
   String _debouncedSystemText = '';
   String _debouncedUserText = '';
 
@@ -708,10 +917,8 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
       if (!mounted) return;
       final newSys = _systemPromptCtrl.text;
       final newUsr = _userPromptCtrl.text;
-      if (newSys.trim() == _debouncedSystemText.trim() &&
-          newUsr.trim() == _debouncedUserText.trim() &&
-          newSys.length == _debouncedSystemText.length &&
-          newUsr.length == _debouncedUserText.length) {
+      // Skip no-op rebuilds when text is unchanged (e.g., cursor/selection changes)
+      if (newSys == _debouncedSystemText && newUsr == _debouncedUserText) {
         return;
       }
       setState(() {
@@ -730,6 +937,23 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   List<SimulationBreakdown> _getOrComputeSimulations() {
     return _cachedSimulations ??=
         _catalog.map(_simulateForModel).toList(growable: false);
+  }
+
+  SimulationBreakdown _simulateForModel(ModelPricing model) {
+    return TokenizerEngine.runSimulation(
+      model: model,
+      systemText: _debouncedSystemText,
+      userText: _debouncedUserText,
+      mode: _mode,
+      reasoningEffort: _reasoningEffort,
+      agentSteps: _agentSteps,
+      toolPayloadTokensPerStep: _toolPayloadTokensPerStep.round(),
+      visibleOutputTokensPerStep: _visibleOutputTokensPerStep.round(),
+      contextCachingEnabled: _contextCachingEnabled,
+      imageCount: _imageCount,
+      pdfPageCount: _pdfPageCount,
+      mediaMinutes: _mediaMinutes,
+    );
   }
 
   // --------------------------------------------------------------------------
@@ -798,8 +1022,9 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   Future<void> _syncLiveOpenRouterPricing() async {
     setState(() => _isSyncing = true);
     try {
-      final uri = Uri.parse('[https://openrouter.ai/api/v1/models](https://openrouter.ai/api/v1/models)');
-      final response = await http.get(uri).timeout(const Duration(seconds: 10));
+      final response = await http
+          .get(kOpenRouterModelsUri)
+          .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final Map<String, dynamic> payload =
@@ -840,7 +1065,9 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
           if (liveIn != null && liveOut != null) {
             matchedCount++;
             final bool isAnthropicStyle =
-                slug.startsWith('anthropic/') || localModel.cacheWritePer1M > localModel.inputPer1M;
+                localModel.provider.toLowerCase().contains('anthropic') ||
+                slug.toLowerCase().contains('claude') ||
+                localModel.cacheWritePer1M > localModel.inputPer1M;
             return localModel.copyWith(
               contextWindow: liveContext ?? localModel.contextWindow,
               inputPer1M: liveIn,
@@ -891,191 +1118,6 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
     } finally {
       if (mounted) setState(() => _isSyncing = false);
     }
-  }
-
-  // --------------------------------------------------------------------------
-  // EXACT TURN-BY-TURN AGENT & CHAT SIMULATION ENGINE
-  // --------------------------------------------------------------------------
-
-  SimulationBreakdown _simulateForModel(ModelPricing model) {
-    final bool truncated =
-        _debouncedSystemText.length > TokenizerEngine.maxInputChars ||
-        _debouncedUserText.length > TokenizerEngine.maxInputChars;
-
-    final int sysTokens = TokenizerEngine.estimateTokenCount(
-      _debouncedSystemText,
-      charsPerToken: model.charsPerToken,
-    );
-    final int usrTokens = TokenizerEngine.estimateTokenCount(
-      _debouncedUserText,
-      charsPerToken: model.charsPerToken,
-    );
-
-    // Per-model multimodal payload estimation (Fix 2.2)
-    final int imageTokens = _imageCount * model.tokensPerImage;
-    final int pdfTokens = _pdfPageCount * model.tokensPerPdfPage;
-    final int mediaTokens = _mediaMinutes * model.tokensPerMediaMinute;
-    final int multiTokens = imageTokens + pdfTokens + mediaTokens;
-
-    final int initialPromptTokens = sysTokens + usrTokens + multiTokens;
-    final int steps = _mode == ExecutionMode.chat ? 1 : _agentSteps;
-    final int toolStepTokens =
-        _mode == ExecutionMode.chat ? 0 : _toolPayloadTokensPerStep.round();
-    final int outPerStep = _visibleOutputTokensPerStep.round();
-    final int thinkPerStep = _reasoningEffort.tokenBudget;
-
-    // Cacheable prefix includes System Prompt + static Multimodal attachments
-    final int cacheablePrefixTokens = sysTokens + multiTokens;
-
-    int totalUncachedInputTokens = 0;
-    int totalCacheWriteTokens = 0;
-    int totalCacheReadTokens = 0;
-    int peakContextTokens = 0;
-    bool crossedLongContext = false;
-
-    double uncachedInputCost = 0.0;
-    double cacheWriteCost = 0.0;
-    double cacheReadCost = 0.0;
-    double visibleOutputCost = 0.0;
-    double reasoningOutputCost = 0.0;
-    double uncachedBaselineCost = 0.0;
-    double uncachedInputBaselineCost = 0.0;
-
-    int rollingHistoryTokens = usrTokens;
-    final List<TurnBreakdown> turnLog = [];
-
-    for (int turn = 1; turn <= steps; turn++) {
-      final int turnTotalContext = cacheablePrefixTokens + rollingHistoryTokens;
-      if (turnTotalContext > peakContextTokens) {
-        peakContextTokens = turnTotalContext;
-      }
-
-      // Only trigger tiered pricing if model actually has a distinct tier below max window (Fix 2.3)
-      final bool isLongContextTurn =
-          model.longContextThreshold < model.contextWindow &&
-          turnTotalContext > model.longContextThreshold;
-      if (isLongContextTurn) crossedLongContext = true;
-
-      final double activeInRate = isLongContextTurn
-          ? model.inputAboveThresholdPer1M
-          : model.inputPer1M;
-      final double activeOutRate = isLongContextTurn
-          ? model.outputAboveThresholdPer1M
-          : model.outputPer1M;
-      final double activeReasonRate = isLongContextTurn
-          ? math.max(
-              model.reasoningOutputPer1M,
-              model.outputAboveThresholdPer1M,
-            )
-          : model.reasoningOutputPer1M;
-
-      final double turnUncachedInputBaseline =
-          (turnTotalContext / 1000000.0) * activeInRate;
-      final double turnOutCost = (outPerStep / 1000000.0) * activeOutRate;
-      final double turnReasonCost =
-          (thinkPerStep / 1000000.0) * activeReasonRate;
-
-      uncachedInputBaselineCost += turnUncachedInputBaseline;
-      uncachedBaselineCost +=
-          turnUncachedInputBaseline + turnOutCost + turnReasonCost;
-
-      int turnUncachedTok = 0;
-      int turnCacheWriteTok = 0;
-      int turnCacheReadTok = 0;
-      double turnInputCost = 0.0;
-
-      if (_contextCachingEnabled &&
-          _mode == ExecutionMode.agent &&
-          cacheablePrefixTokens > 0) {
-        if (turn == 1) {
-          // Turn 1 writes the static prefix to cache and bills dynamic user tokens normally (Fix 1.3)
-          final double writeCost =
-              (cacheablePrefixTokens / 1000000.0) * model.cacheWritePer1M;
-          final double dynCost =
-              (rollingHistoryTokens / 1000000.0) * activeInRate;
-          cacheWriteCost += writeCost;
-          uncachedInputCost += dynCost;
-          turnInputCost = writeCost + dynCost;
-
-          turnCacheWriteTok = cacheablePrefixTokens;
-          turnUncachedTok = rollingHistoryTokens;
-          totalCacheWriteTokens += cacheablePrefixTokens;
-          totalUncachedInputTokens += rollingHistoryTokens;
-        } else {
-          // Turn 2..N reads the cached prefix at discounted rate + bills growing dynamic history
-          final double readCost =
-              (cacheablePrefixTokens / 1000000.0) * model.cacheReadPer1M;
-          final double dynCost =
-              (rollingHistoryTokens / 1000000.0) * activeInRate;
-          cacheReadCost += readCost;
-          uncachedInputCost += dynCost;
-          turnInputCost = readCost + dynCost;
-
-          turnCacheReadTok = cacheablePrefixTokens;
-          turnUncachedTok = rollingHistoryTokens;
-          totalCacheReadTokens += cacheablePrefixTokens;
-          totalUncachedInputTokens += rollingHistoryTokens;
-        }
-      } else {
-        // No context caching
-        turnInputCost = turnUncachedInputBaseline;
-        uncachedInputCost += turnInputCost;
-        turnUncachedTok = turnTotalContext;
-        totalUncachedInputTokens += turnTotalContext;
-      }
-
-      visibleOutputCost += turnOutCost;
-      reasoningOutputCost += turnReasonCost;
-
-      turnLog.add(
-        TurnBreakdown(
-          turnNumber: turn,
-          totalContextTokens: turnTotalContext,
-          uncachedInputTokens: turnUncachedTok,
-          cacheWriteTokens: turnCacheWriteTok,
-          cacheReadTokens: turnCacheReadTok,
-          outputTokens: outPerStep,
-          reasoningTokens: thinkPerStep,
-          turnCost: turnInputCost + turnOutCost + turnReasonCost,
-          isLongContextTier: isLongContextTurn,
-        ),
-      );
-
-      // Compound context for the next agent step (prior output + tool observation)
-      rollingHistoryTokens += outPerStep + toolStepTokens;
-    }
-
-    final double totalCostSingleRun = uncachedInputCost +
-        cacheWriteCost +
-        cacheReadCost +
-        visibleOutputCost +
-        reasoningOutputCost;
-
-    return SimulationBreakdown(
-      model: model,
-      systemTextTokens: sysTokens,
-      userTextTokens: usrTokens,
-      multimodalTokens: multiTokens,
-      initialPromptTokens: initialPromptTokens,
-      peakTurnContextTokens: peakContextTokens,
-      totalBilledInputTokens: totalUncachedInputTokens,
-      totalCacheWriteTokens: totalCacheWriteTokens,
-      totalCachedReadTokens: totalCacheReadTokens,
-      totalVisibleOutputTokens: outPerStep * steps,
-      totalReasoningTokens: thinkPerStep * steps,
-      exceedsContextWindow: peakContextTokens > model.contextWindow,
-      crossedLongContextTier: crossedLongContext,
-      textWasTruncated: truncated,
-      uncachedInputCost: uncachedInputCost,
-      cacheWriteCost: cacheWriteCost,
-      cacheReadCost: cacheReadCost,
-      visibleOutputCost: visibleOutputCost,
-      reasoningOutputCost: reasoningOutputCost,
-      totalCostSingleRun: totalCostSingleRun,
-      uncachedBaselineCost: uncachedBaselineCost,
-      uncachedInputBaselineCost: uncachedInputBaselineCost,
-      turns: turnLog,
-    );
   }
 
   // --------------------------------------------------------------------------
@@ -1350,8 +1392,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   }
 
   Widget _buildSplitPromptInputsCard(SimulationBreakdown sim) {
-    final combinedText =
-        '$_debouncedSystemText\n$_debouncedUserText'.trim();
+    final combinedText = '$_debouncedSystemText\n$_debouncedUserText'.trim();
     final spans = _showTokenInspector
         ? TokenizerEngine.tokenizeToSpans(
             combinedText,
@@ -1525,7 +1566,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                         ),
                         _LegendBadge(
                           color: Color(0xFF701A75),
-                          label: 'CJK / Emoji (2-3× BPE)',
+                          label: 'CJK / Emoji Cluster (2-4× BPE)',
                         ),
                       ],
                     ),
@@ -1925,7 +1966,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
 
   Widget _buildRightTelemetryColumn(SimulationBreakdown sim) {
     final scaledCost = sim.totalCostSingleRun * _batchMultiplier;
-    final savingsPct = sim.cacheSavingsPercent;
+    final impactPct = sim.cacheImpactPercent;
 
     return Card(
       child: Padding(
@@ -2007,26 +2048,26 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                           color: Color(0xFFA5B4FC),
                         ),
                       ),
-                      if (savingsPct.abs() >= 0.5)
+                      if (impactPct.abs() >= 0.5)
                         Container(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 8,
                             vertical: 2,
                           ),
                           decoration: BoxDecoration(
-                            color: savingsPct > 0
+                            color: impactPct > 0
                                 ? const Color(0xFF065F46)
                                 : const Color(0xFF7F1D1D),
                             borderRadius: BorderRadius.circular(99),
                           ),
                           child: Text(
-                            savingsPct > 0
-                                ? 'Input Cache Saved ${savingsPct.toStringAsFixed(1)}%'
-                                : 'Cache Penalty +${savingsPct.abs().toStringAsFixed(1)}%',
+                            impactPct > 0
+                                ? 'Input Cache Saved ${impactPct.toStringAsFixed(1)}%'
+                                : 'Cache Penalty +${impactPct.abs().toStringAsFixed(1)}%',
                             style: TextStyle(
                               fontSize: 11,
                               fontWeight: FontWeight.bold,
-                              color: savingsPct > 0
+                              color: impactPct > 0
                                   ? const Color(0xFF6EE7B7)
                                   : const Color(0xFFFCA5A5),
                             ),
@@ -2098,7 +2139,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
             ),
             const Divider(height: 28, color: Color(0xFF1F2937)),
 
-            // Granular Token & Cost Ledger (Fix 1.3: separated Turn-1 Write vs Uncached Input)
+            // Granular Token & Cost Ledger
             const Text(
               'GRANULAR TOKEN & BILLING LEDGER (PER 1 WORKFLOW)',
               style: TextStyle(
@@ -2137,7 +2178,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               highlightColor: const Color(0xFFF59E0B),
             ),
 
-            // Per-Turn Expansion Toggle (Review Question 5)
+            // Per-Turn Expansion Toggle
             const SizedBox(height: 8),
             InkWell(
               borderRadius: BorderRadius.circular(8),
@@ -2228,7 +2269,18 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                       ),
                     );
                   }
-                } catch (_) {}
+                } catch (err) {
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          'Clipboard access denied by browser/OS ($err).',
+                        ),
+                        backgroundColor: const Color(0xFFD97706),
+                      ),
+                    );
+                  }
+                }
               },
               icon: const Icon(Icons.copy, size: 16),
               label: const Text('Copy Telemetry Report'),
@@ -2401,14 +2453,14 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                 ],
                 rows: simulations.map((sim) {
                   final isSelected = sim.model.id == _selectedModelId;
-                  final pct = sim.cacheSavingsPercent;
-                  String cacheLabel = '0%';
+                  final pct = sim.cacheImpactPercent;
+                  String cacheLabel = 'neutral (0%)';
                   Color cacheColor = const Color(0xFF6B7280);
                   if (pct >= 0.5) {
-                    cacheLabel = '-${pct.toStringAsFixed(1)}%';
+                    cacheLabel = 'saved ${pct.toStringAsFixed(1)}%';
                     cacheColor = const Color(0xFF34D399);
                   } else if (pct <= -0.5) {
-                    cacheLabel = '+${pct.abs().toStringAsFixed(1)}% penalty';
+                    cacheLabel = 'cost +${pct.abs().toStringAsFixed(1)}%';
                     cacheColor = const Color(0xFFF87171);
                   }
 
@@ -2557,7 +2609,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   }
 
   // --------------------------------------------------------------------------
-  // FORMATTING HELPERS (SAFE FOR NEGATIVES & CONSISTENT PRECISION)
+  // FORMATTING HELPERS
   // --------------------------------------------------------------------------
 
   String _formatNumber(int n) {
@@ -2583,7 +2635,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
 }
 
 // ============================================================================
-// DEDICATED STATEFUL DIALOG FOR JSON PRICING SCHEMA (FIXES 1.4, 3.2, 4.5)
+// DEDICATED STATEFUL DIALOG FOR JSON PRICING SCHEMA
 // ============================================================================
 
 class _PricingSchemaDialog extends StatefulWidget {
@@ -2627,7 +2679,8 @@ class _PricingSchemaDialogState extends State<_PricingSchemaDialog> {
   Widget build(BuildContext context) {
     final viewport = MediaQuery.sizeOf(context);
     final dialogWidth = math.min(720.0, math.max(280.0, viewport.width - 32));
-    final dialogHeight = math.min(480.0, math.max(260.0, viewport.height - 140));
+    final dialogHeight =
+        math.min(480.0, math.max(260.0, viewport.height - 140));
 
     return AlertDialog(
       backgroundColor: const Color(0xFF111827),
