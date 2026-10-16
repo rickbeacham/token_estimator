@@ -9,9 +9,14 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Top-level OpenRouter API endpoint constructed via [Uri.https] to guarantee
-/// valid host/path resolution and prevent markdown auto-linker corruption.
-final Uri kOpenRouterModelsUri = Uri.https('openrouter.ai', '/api/v1/models');
+const String kOpenRouterModelsPath = '/api/v1/models';
+
+/// OpenRouter models endpoint. Constructed via [Uri.https] so the host and
+/// path are validated at construction rather than at request time.
+final Uri openRouterModelsUri = Uri.https(
+  'openrouter.ai',
+  kOpenRouterModelsPath,
+);
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -377,8 +382,258 @@ const List<ModelPricing> kDefaultModelCatalog = [
 ];
 
 // ============================================================================
-// SIMULATION RESULT MODEL & ENGINE
+// TOKENIZER ENGINE (SINGLE RESPONSIBILITY: TEXT -> WEIGHTED BPE SPANS)
 // ============================================================================
+
+class TokenizerEngine {
+  static const int maxInputChars = 200000;
+  static const int _maxCacheEntries = 64;
+
+  static final LinkedHashMap<String, int> _countCache =
+      LinkedHashMap<String, int>();
+
+  /// Clears the static token count LRU cache (useful for isolated widget/unit tests).
+  @visibleForTesting
+  static void clearCache() => _countCache.clear();
+
+  /// Unicode-aware regex handling:
+  /// 1: Whitespace runs
+  /// 2: Numeric literals
+  /// 3: Multi-char code operators & markdown fences
+  /// 4: ASCII & Latin/Cyrillic identifiers
+  /// 5: CJK ideographs & Hangul syllables
+  /// 6: Complete Emoji clusters (Regional Indicator pairs, ZWJ sequences,
+  ///    skin-tone modifiers \u{1F3FB}-\u{1F3FF}, and variation selectors \uFE0F)
+  /// 7: Standalone zero-width joiners / variation selectors (weight 0)
+  /// 8: Single-char punctuation fallback
+  static final RegExp _tokenRegex = RegExp(
+    r'(\s+)'
+    r'|([0-9]+(?:\.[0-9]+)?)'
+    r'|(```|===|!==|>>>|<<|>>|->|=>|::|\|\||&&|<=|>=|==|!=|\+\+|--)'
+    r'|([A-Za-z_\u00C0-\u024F\u0400-\u04FF][A-Za-z0-9_\u00C0-\u024F\u0400-\u04FF]*)'
+    r'|([\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF])'
+    r'|([\u{1F1E6}-\u{1F1FF}]{2}|(?:[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}][\u{1F3FB}-\u{1F3FF}\uFE0F]?(?:\u200D[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}][\u{1F3FB}-\u{1F3FF}\uFE0F]?)*))'
+    r'|([\u200D\uFE0F]+)'
+    r'|([^\sA-Za-z0-9_])',
+    unicode: true,
+  );
+
+  /// Truncates input at [maxInputChars] UTF-16 code units without splitting
+  /// a surrogate pair across the boundary.
+  static String capInput(String text) {
+    if (text.length <= maxInputChars) return text;
+    int end = maxInputChars;
+    if (end > 0 && end < text.length) {
+      final int cu = text.codeUnitAt(end - 1);
+      if (cu >= 0xD800 && cu <= 0xDBFF) {
+        end -= 1;
+      }
+    }
+    return text.substring(0, end);
+  }
+
+  /// Content-aware subword tokenizer that handles multi-char operators,
+  /// Cyrillic/CJK scripts, and grouped ZWJ/flag emoji sequences.
+  static List<TokenSpanItem> tokenizeToSpans(
+    String rawText, {
+    double charsPerToken = 3.8,
+  }) {
+    if (rawText.isEmpty) return const [];
+    final text = capInput(rawText);
+    final List<TokenSpanItem> spans = [];
+    final matches = _tokenRegex.allMatches(text);
+    final int subwordChunk = math.max(3, charsPerToken.round() + 1);
+
+    for (final m in matches) {
+      final full = m.group(0)!;
+      if (m.group(1) != null) {
+        if (full.length <= 4) {
+          spans.add(TokenSpanItem(full, TokenKind.whitespace));
+        } else {
+          for (int i = 0; i < full.length; i += 4) {
+            spans.add(TokenSpanItem(
+              full.substring(i, math.min(i + 4, full.length)),
+              TokenKind.whitespace,
+            ));
+          }
+        }
+      } else if (m.group(2) != null) {
+        for (int i = 0; i < full.length; i += 3) {
+          spans.add(TokenSpanItem(
+            full.substring(i, math.min(i + 3, full.length)),
+            TokenKind.number,
+          ));
+        }
+      } else if (m.group(3) != null) {
+        spans.add(TokenSpanItem(full, TokenKind.codePunct));
+      } else if (m.group(4) != null) {
+        final bool isNonAscii = full.codeUnits.any((c) => c > 127);
+        final int step =
+            isNonAscii ? math.max(2, subwordChunk - 1) : subwordChunk;
+        if (full.length <= step + 2) {
+          spans.add(TokenSpanItem(full, TokenKind.word));
+        } else {
+          for (int i = 0; i < full.length; i += step) {
+            spans.add(TokenSpanItem(
+              full.substring(i, math.min(i + step, full.length)),
+              TokenKind.word,
+            ));
+          }
+        }
+      } else if (m.group(5) != null) {
+        spans.add(TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: 2));
+      } else if (m.group(6) != null) {
+        final int weight = full.contains('\u200D') ? 4 : 3;
+        spans.add(
+          TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: weight),
+        );
+      } else if (m.group(7) != null) {
+        continue;
+      } else {
+        spans.add(TokenSpanItem(full, TokenKind.codePunct));
+      }
+    }
+    return spans;
+  }
+
+  /// Memoized token count with an LRU cache keyed on (hashCode, length, charsPerToken).
+  static int estimateTokenCount(String rawText, {double charsPerToken = 3.8}) {
+    final text = capInput(rawText);
+    if (text.trim().isEmpty) return 0;
+
+    final String cacheKey =
+        '${text.hashCode}:${text.length}:${charsPerToken.toStringAsFixed(2)}';
+    final int? cached = _countCache.remove(cacheKey);
+    if (cached != null) {
+      _countCache[cacheKey] = cached; // Refresh LRU order
+      return cached;
+    }
+
+    final spans = tokenizeToSpans(text, charsPerToken: charsPerToken);
+    int count = 0;
+    bool prevWasSpace = false;
+    for (final s in spans) {
+      if (s.kind == TokenKind.whitespace) {
+        if (prevWasSpace || s.text.contains('\n')) {
+          count++;
+        }
+        prevWasSpace = true;
+      } else {
+        count += s.bpeWeight;
+        prevWasSpace = false;
+      }
+    }
+
+    final int result = math.max(1, count);
+    if (_countCache.length >= _maxCacheEntries) {
+      _countCache.remove(_countCache.keys.first);
+    }
+    _countCache[cacheKey] = result;
+    return result;
+  }
+}
+
+// ============================================================================
+// SIMULATION REQUEST, RESULT MODELS & ENGINE
+// ============================================================================
+
+typedef TokenizerFn = int Function(String text, {double charsPerToken});
+
+class SimulationRequest {
+  final ModelPricing model;
+  final String systemText;
+  final String userText;
+  final ExecutionMode mode;
+  final ReasoningPreset reasoningEffort;
+  final int agentSteps;
+  final int toolPayloadTokensPerStep;
+  final int visibleOutputTokensPerStep;
+  final bool contextCachingEnabled;
+  final int imageCount;
+  final int pdfPageCount;
+  final int mediaMinutes;
+
+  const SimulationRequest({
+    required this.model,
+    required this.systemText,
+    required this.userText,
+    required this.mode,
+    required this.reasoningEffort,
+    required this.agentSteps,
+    required this.toolPayloadTokensPerStep,
+    required this.visibleOutputTokensPerStep,
+    required this.contextCachingEnabled,
+    this.imageCount = 0,
+    this.pdfPageCount = 0,
+    this.mediaMinutes = 0,
+  });
+
+  SimulationRequest copyWith({
+    ModelPricing? model,
+    String? systemText,
+    String? userText,
+    ExecutionMode? mode,
+    ReasoningPreset? reasoningEffort,
+    int? agentSteps,
+    int? toolPayloadTokensPerStep,
+    int? visibleOutputTokensPerStep,
+    bool? contextCachingEnabled,
+    int? imageCount,
+    int? pdfPageCount,
+    int? mediaMinutes,
+  }) {
+    return SimulationRequest(
+      model: model ?? this.model,
+      systemText: systemText ?? this.systemText,
+      userText: userText ?? this.userText,
+      mode: mode ?? this.mode,
+      reasoningEffort: reasoningEffort ?? this.reasoningEffort,
+      agentSteps: agentSteps ?? this.agentSteps,
+      toolPayloadTokensPerStep:
+          toolPayloadTokensPerStep ?? this.toolPayloadTokensPerStep,
+      visibleOutputTokensPerStep:
+          visibleOutputTokensPerStep ?? this.visibleOutputTokensPerStep,
+      contextCachingEnabled:
+          contextCachingEnabled ?? this.contextCachingEnabled,
+      imageCount: imageCount ?? this.imageCount,
+      pdfPageCount: pdfPageCount ?? this.pdfPageCount,
+      mediaMinutes: mediaMinutes ?? this.mediaMinutes,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is SimulationRequest &&
+          other.model.id == model.id &&
+          other.systemText == systemText &&
+          other.userText == userText &&
+          other.mode == mode &&
+          other.reasoningEffort == reasoningEffort &&
+          other.agentSteps == agentSteps &&
+          other.toolPayloadTokensPerStep == toolPayloadTokensPerStep &&
+          other.visibleOutputTokensPerStep == visibleOutputTokensPerStep &&
+          other.contextCachingEnabled == contextCachingEnabled &&
+          other.imageCount == imageCount &&
+          other.pdfPageCount == pdfPageCount &&
+          other.mediaMinutes == mediaMinutes);
+
+  @override
+  int get hashCode => Object.hash(
+        model.id,
+        systemText,
+        userText,
+        mode,
+        reasoningEffort,
+        agentSteps,
+        toolPayloadTokensPerStep,
+        visibleOutputTokensPerStep,
+        contextCachingEnabled,
+        imageCount,
+        pdfPageCount,
+        mediaMinutes,
+      );
+}
 
 class TurnBreakdown {
   final int turnNumber;
@@ -492,186 +747,39 @@ class SimulationBreakdown {
       );
 }
 
-class TokenizerEngine {
-  static const int maxInputChars = 200000;
-  static const int _maxCacheEntries = 64;
+class SimulationEngine {
+  final TokenizerFn tokenizer;
 
-  static final LinkedHashMap<String, int> _countCache =
-      LinkedHashMap<String, int>();
+  const SimulationEngine({
+    this.tokenizer = TokenizerEngine.estimateTokenCount,
+  });
 
-  /// Clears the static token count LRU cache (useful for isolated widget/unit tests).
-  @visibleForTesting
-  static void clearCache() => _countCache.clear();
-
-  /// Unicode-aware regex handling:
-  /// 1: Whitespace runs
-  /// 2: Numeric literals
-  /// 3: Multi-char code operators & markdown fences
-  /// 4: ASCII & Latin/Cyrillic identifiers
-  /// 5: CJK ideographs & Hangul syllables
-  /// 6: Complete Emoji clusters (Regional Indicator pairs, ZWJ sequences,
-  ///    skin-tone modifiers \u{1F3FB}-\u{1F3FF}, and variation selectors \uFE0F)
-  /// 7: Standalone zero-width joiners / variation selectors (weight 0)
-  /// 8: Single-char punctuation fallback
-  static final RegExp _tokenRegex = RegExp(
-    r'(\s+)'
-    r'|([0-9]+(?:\.[0-9]+)?)'
-    r'|(```|===|!==|>>>|<<|>>|->|=>|::|\|\||&&|<=|>=|==|!=|\+\+|--)'
-    r'|([A-Za-z_\u00C0-\u024F\u0400-\u04FF][A-Za-z0-9_\u00C0-\u024F\u0400-\u04FF]*)'
-    r'|([\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF])'
-    r'|([\u{1F1E6}-\u{1F1FF}]{2}|(?:[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}][\u{1F3FB}-\u{1F3FF}\uFE0F]?(?:\u200D[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}][\u{1F3FB}-\u{1F3FF}\uFE0F]?)*))'
-    r'|([\u200D\uFE0F]+)'
-    r'|([^\sA-Za-z0-9_])',
-    unicode: true,
-  );
-
-  static String capInput(String text) {
-    if (text.length <= maxInputChars) return text;
-    return text.substring(0, maxInputChars);
-  }
-
-  /// Content-aware subword tokenizer that handles multi-char operators,
-  /// Cyrillic/CJK scripts, and grouped ZWJ/flag emoji sequences.
-  static List<TokenSpanItem> tokenizeToSpans(
-    String rawText, {
-    double charsPerToken = 3.8,
-  }) {
-    if (rawText.isEmpty) return const [];
-    final text = capInput(rawText);
-    final List<TokenSpanItem> spans = [];
-    final matches = _tokenRegex.allMatches(text);
-    final int subwordChunk = math.max(3, charsPerToken.round() + 1);
-
-    for (final m in matches) {
-      final full = m.group(0)!;
-      if (m.group(1) != null) {
-        if (full.length <= 4) {
-          spans.add(TokenSpanItem(full, TokenKind.whitespace));
-        } else {
-          for (int i = 0; i < full.length; i += 4) {
-            spans.add(TokenSpanItem(
-              full.substring(i, math.min(i + 4, full.length)),
-              TokenKind.whitespace,
-            ));
-          }
-        }
-      } else if (m.group(2) != null) {
-        for (int i = 0; i < full.length; i += 3) {
-          spans.add(TokenSpanItem(
-            full.substring(i, math.min(i + 3, full.length)),
-            TokenKind.number,
-          ));
-        }
-      } else if (m.group(3) != null) {
-        spans.add(TokenSpanItem(full, TokenKind.codePunct));
-      } else if (m.group(4) != null) {
-        final bool isNonAscii = full.codeUnits.any((c) => c > 127);
-        final int step =
-            isNonAscii ? math.max(2, subwordChunk - 1) : subwordChunk;
-        if (full.length <= step + 2) {
-          spans.add(TokenSpanItem(full, TokenKind.word));
-        } else {
-          for (int i = 0; i < full.length; i += step) {
-            spans.add(TokenSpanItem(
-              full.substring(i, math.min(i + step, full.length)),
-              TokenKind.word,
-            ));
-          }
-        }
-      } else if (m.group(5) != null) {
-        // CJK character (~1.5-2 BPE tokens)
-        spans.add(TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: 2));
-      } else if (m.group(6) != null) {
-        // Complete Emoji or ZWJ/Flag cluster: 3 tokens for single/flag, 4 for composite ZWJ
-        final int weight = full.contains('\u200D') ? 4 : 3;
-        spans.add(
-          TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: weight),
-        );
-      } else if (m.group(7) != null) {
-        // Stray zero-width joiners or variation selectors carry 0 standalone token weight
-        continue;
-      } else {
-        spans.add(TokenSpanItem(full, TokenKind.codePunct));
-      }
-    }
-    return spans;
-  }
-
-  /// Memoized token count with an LRU cache keyed on (hashCode, length, charsPerToken).
-  static int estimateTokenCount(String rawText, {double charsPerToken = 3.8}) {
-    final text = capInput(rawText);
-    if (text.trim().isEmpty) return 0;
-
-    final String cacheKey =
-        '${text.hashCode}:${text.length}:${charsPerToken.toStringAsFixed(2)}';
-    final int? cached = _countCache.remove(cacheKey);
-    if (cached != null) {
-      _countCache[cacheKey] = cached; // Refresh LRU order
-      return cached;
-    }
-
-    final spans = tokenizeToSpans(text, charsPerToken: charsPerToken);
-    int count = 0;
-    bool prevWasSpace = false;
-    for (final s in spans) {
-      if (s.kind == TokenKind.whitespace) {
-        if (prevWasSpace || s.text.contains('\n')) {
-          count++;
-        }
-        prevWasSpace = true;
-      } else {
-        count += s.bpeWeight;
-        prevWasSpace = false;
-      }
-    }
-
-    final int result = math.max(1, count);
-    if (_countCache.length >= _maxCacheEntries) {
-      _countCache.remove(_countCache.keys.first);
-    }
-    _countCache[cacheKey] = result;
-    return result;
-  }
-
-  /// Standalone simulation runner so unit tests can verify simulation math
-  /// without instantiating the widget tree.
-  static SimulationBreakdown runSimulation({
-    required ModelPricing model,
-    required String systemText,
-    required String userText,
-    required ExecutionMode mode,
-    required ReasoningPreset reasoningEffort,
-    required int agentSteps,
-    required int toolPayloadTokensPerStep,
-    required int visibleOutputTokensPerStep,
-    required bool contextCachingEnabled,
-    int imageCount = 0,
-    int pdfPageCount = 0,
-    int mediaMinutes = 0,
-  }) {
+  SimulationBreakdown simulate(SimulationRequest req) {
+    final model = req.model;
     final bool truncated =
-        systemText.length > maxInputChars || userText.length > maxInputChars;
+        req.systemText.length > TokenizerEngine.maxInputChars ||
+        req.userText.length > TokenizerEngine.maxInputChars;
 
-    final int sysTokens = estimateTokenCount(
-      systemText,
+    final int sysTokens = tokenizer(
+      req.systemText,
       charsPerToken: model.charsPerToken,
     );
-    final int usrTokens = estimateTokenCount(
-      userText,
+    final int usrTokens = tokenizer(
+      req.userText,
       charsPerToken: model.charsPerToken,
     );
 
-    final int imageTokens = imageCount * model.tokensPerImage;
-    final int pdfTokens = pdfPageCount * model.tokensPerPdfPage;
-    final int mediaTokens = mediaMinutes * model.tokensPerMediaMinute;
+    final int imageTokens = req.imageCount * model.tokensPerImage;
+    final int pdfTokens = req.pdfPageCount * model.tokensPerPdfPage;
+    final int mediaTokens = req.mediaMinutes * model.tokensPerMediaMinute;
     final int multiTokens = imageTokens + pdfTokens + mediaTokens;
 
     final int initialPromptTokens = sysTokens + usrTokens + multiTokens;
-    final int steps = mode == ExecutionMode.chat ? 1 : agentSteps;
+    final int steps = req.mode == ExecutionMode.chat ? 1 : req.agentSteps;
     final int toolStepTokens =
-        mode == ExecutionMode.chat ? 0 : toolPayloadTokensPerStep;
-    final int outPerStep = visibleOutputTokensPerStep;
-    final int thinkPerStep = reasoningEffort.tokenBudget;
+        req.mode == ExecutionMode.chat ? 0 : req.toolPayloadTokensPerStep;
+    final int outPerStep = req.visibleOutputTokensPerStep;
+    final int thinkPerStep = req.reasoningEffort.tokenBudget;
 
     final int cacheablePrefixTokens = sysTokens + multiTokens;
 
@@ -731,8 +839,8 @@ class TokenizerEngine {
       int turnCacheReadTok = 0;
       double turnInputCost = 0.0;
 
-      if (contextCachingEnabled &&
-          mode == ExecutionMode.agent &&
+      if (req.contextCachingEnabled &&
+          req.mode == ExecutionMode.agent &&
           cacheablePrefixTokens > 0) {
         if (turn == 1) {
           final double writeCost =
@@ -837,6 +945,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   static const String _prefsCatalogKey = 'custom_pricing_catalog_v2';
   static const String _prefsLastSyncKey = 'last_pricing_sync_time_v2';
   static const int _currentSchemaVersion = 2;
+  static const SimulationEngine _simulationEngine = SimulationEngine();
 
   List<ModelPricing> _catalog = List.from(kDefaultModelCatalog);
   late String _selectedModelId;
@@ -934,13 +1043,8 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
         orElse: () => _catalog.first,
       );
 
-  List<SimulationBreakdown> _getOrComputeSimulations() {
-    return _cachedSimulations ??=
-        _catalog.map(_simulateForModel).toList(growable: false);
-  }
-
-  SimulationBreakdown _simulateForModel(ModelPricing model) {
-    return TokenizerEngine.runSimulation(
+  SimulationRequest _buildRequestForModel(ModelPricing model) {
+    return SimulationRequest(
       model: model,
       systemText: _debouncedSystemText,
       userText: _debouncedUserText,
@@ -954,6 +1058,12 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
       pdfPageCount: _pdfPageCount,
       mediaMinutes: _mediaMinutes,
     );
+  }
+
+  List<SimulationBreakdown> _getOrComputeSimulations() {
+    return _cachedSimulations ??= _catalog
+        .map((m) => _simulationEngine.simulate(_buildRequestForModel(m)))
+        .toList(growable: false);
   }
 
   // --------------------------------------------------------------------------
@@ -1023,7 +1133,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
     setState(() => _isSyncing = true);
     try {
       final response = await http
-          .get(kOpenRouterModelsUri)
+          .get(openRouterModelsUri)
           .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
@@ -1461,7 +1571,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: const Text(
-                  'Input exceeds 200,000 characters — truncated for real-time BPE estimation.',
+                  'Input exceeds 200,000 characters — truncated cleanly at surrogate boundary for real-time BPE estimation.',
                   style: TextStyle(fontSize: 12, color: Color(0xFFFDE68A)),
                 ),
               ),
@@ -2679,8 +2789,11 @@ class _PricingSchemaDialogState extends State<_PricingSchemaDialog> {
   Widget build(BuildContext context) {
     final viewport = MediaQuery.sizeOf(context);
     final dialogWidth = math.min(720.0, math.max(280.0, viewport.width - 32));
-    final dialogHeight =
-        math.min(480.0, math.max(260.0, viewport.height - 140));
+    // Accounts for AlertDialog vertical insets (48) + title (~56) + actions (~52) + slack
+    final dialogHeight = math.max(
+      120.0,
+      math.min(480.0, viewport.height - 220),
+    );
 
     return AlertDialog(
       backgroundColor: const Color(0xFF111827),
