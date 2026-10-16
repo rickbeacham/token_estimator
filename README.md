@@ -2,7 +2,8 @@
 ### *Wǔxíng Suànmín*
 **AI Token & Agent Loop Cost Simulator**
 
-![App Preview](https://via.placeholder.com/800x400/111827/FFFFFF?text=token_estimator+UI+Preview)
+![App Preview](https://github.com/rickbeacham/token_estimator/blob/f300a03deb903c9af92b763a4c3a49f7dafb1d88/screenshot-chrome-build.jpg)
+![App Preview](https://cdn.jsdelivr.net/gh/rickbeacham/token_estimator@main/screenshot-chrome-build.jpg)
 
 ---
 
