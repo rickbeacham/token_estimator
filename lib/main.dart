@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -73,23 +75,62 @@ class TokenEstimatorApp extends StatelessWidget {
 
 enum ExecutionMode { chat, agent }
 
-enum ReasoningEffort {
-  off('Off', 0),
-  low('Low (+1k)', 1024),
-  medium('Med (+4k)', 4096),
-  high('High (+16k)', 16384);
-
+class ReasoningPreset {
+  final String id;
   final String label;
+  final String shortLabel;
   final int tokenBudget;
-  const ReasoningEffort(this.label, this.tokenBudget);
+
+  const ReasoningPreset({
+    required this.id,
+    required this.label,
+    required this.shortLabel,
+    required this.tokenBudget,
+  });
+
+  static const off = ReasoningPreset(
+    id: 'off',
+    label: 'Off',
+    shortLabel: 'Off',
+    tokenBudget: 0,
+  );
+  static const low = ReasoningPreset(
+    id: 'low',
+    label: 'Low (+1k)',
+    shortLabel: '+1k',
+    tokenBudget: 1024,
+  );
+  static const medium = ReasoningPreset(
+    id: 'med',
+    label: 'Med (+4k)',
+    shortLabel: '+4k',
+    tokenBudget: 4096,
+  );
+  static const high = ReasoningPreset(
+    id: 'high',
+    label: 'High (+16k)',
+    shortLabel: '+16k',
+    tokenBudget: 16384,
+  );
+
+  static const List<ReasoningPreset> values = [off, low, medium, high];
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is ReasoningPreset && other.id == id);
+
+  @override
+  int get hashCode => id.hashCode;
 }
 
-enum TokenKind { word, codePunct, number, whitespace }
+enum TokenKind { word, codePunct, number, whitespace, emojiOrNonLatin }
 
 class TokenSpanItem {
   final String text;
   final TokenKind kind;
-  const TokenSpanItem(this.text, this.kind);
+  final int bpeWeight;
+  const TokenSpanItem(this.text, this.kind, {this.bpeWeight = 1});
 }
 
 class ModelPricing {
@@ -114,6 +155,11 @@ class ModelPricing {
   final double cacheWritePer1M; // Turn 1 creation rate
   final double cacheReadPer1M; // Turn 2..N read hit rate
 
+  // Model-specific multimodal token weights
+  final int tokensPerImage;
+  final int tokensPerPdfPage;
+  final int tokensPerMediaMinute;
+
   const ModelPricing({
     required this.id,
     required this.name,
@@ -129,6 +175,9 @@ class ModelPricing {
     required this.outputAboveThresholdPer1M,
     required this.cacheWritePer1M,
     required this.cacheReadPer1M,
+    this.tokensPerImage = 258,
+    this.tokensPerPdfPage = 850,
+    this.tokensPerMediaMinute = 15000,
   });
 
   ModelPricing copyWith({
@@ -144,6 +193,9 @@ class ModelPricing {
     double? outputAboveThresholdPer1M,
     double? cacheWritePer1M,
     double? cacheReadPer1M,
+    int? tokensPerImage,
+    int? tokensPerPdfPage,
+    int? tokensPerMediaMinute,
   }) {
     return ModelPricing(
       id: id,
@@ -162,6 +214,9 @@ class ModelPricing {
           outputAboveThresholdPer1M ?? this.outputAboveThresholdPer1M,
       cacheWritePer1M: cacheWritePer1M ?? this.cacheWritePer1M,
       cacheReadPer1M: cacheReadPer1M ?? this.cacheReadPer1M,
+      tokensPerImage: tokensPerImage ?? this.tokensPerImage,
+      tokensPerPdfPage: tokensPerPdfPage ?? this.tokensPerPdfPage,
+      tokensPerMediaMinute: tokensPerMediaMinute ?? this.tokensPerMediaMinute,
     );
   }
 
@@ -180,6 +235,9 @@ class ModelPricing {
         'outputAboveThresholdPer1M': outputAboveThresholdPer1M,
         'cacheWritePer1M': cacheWritePer1M,
         'cacheReadPer1M': cacheReadPer1M,
+        'tokensPerImage': tokensPerImage,
+        'tokensPerPdfPage': tokensPerPdfPage,
+        'tokensPerMediaMinute': tokensPerMediaMinute,
       };
 
   factory ModelPricing.fromJson(Map<String, dynamic> json) {
@@ -207,11 +265,15 @@ class ModelPricing {
           (json['cacheWritePer1M'] as num?)?.toDouble() ?? inBase * 1.25,
       cacheReadPer1M:
           (json['cacheReadPer1M'] as num?)?.toDouble() ?? inBase * 0.25,
+      tokensPerImage: (json['tokensPerImage'] as num?)?.toInt() ?? 258,
+      tokensPerPdfPage: (json['tokensPerPdfPage'] as num?)?.toInt() ?? 850,
+      tokensPerMediaMinute:
+          (json['tokensPerMediaMinute'] as num?)?.toInt() ?? 15000,
     );
   }
 }
 
-// Default curated frontier catalog with tiered thresholds & split cache pricing
+// Default curated frontier catalog with per-model multimodal token weights
 const List<ModelPricing> kDefaultModelCatalog = [
   ModelPricing(
     id: 'gemini-4-argon',
@@ -228,6 +290,9 @@ const List<ModelPricing> kDefaultModelCatalog = [
     outputAboveThresholdPer1M: 15.00,
     cacheWritePer1M: 1.25,
     cacheReadPer1M: 0.31,
+    tokensPerImage: 258,
+    tokensPerPdfPage: 850,
+    tokensPerMediaMinute: 15000,
   ),
   ModelPricing(
     id: 'gemini-3-flash',
@@ -244,6 +309,9 @@ const List<ModelPricing> kDefaultModelCatalog = [
     outputAboveThresholdPer1M: 1.20,
     cacheWritePer1M: 0.15,
     cacheReadPer1M: 0.0375,
+    tokensPerImage: 258,
+    tokensPerPdfPage: 850,
+    tokensPerMediaMinute: 15000,
   ),
   ModelPricing(
     id: 'claude-sonnet',
@@ -260,6 +328,9 @@ const List<ModelPricing> kDefaultModelCatalog = [
     outputAboveThresholdPer1M: 22.50,
     cacheWritePer1M: 3.75, // +25% cache write penalty on Turn 1
     cacheReadPer1M: 0.30, // 90% discount on cache read
+    tokensPerImage: 1600, // Claude ~1600 tokens per 1080p image
+    tokensPerPdfPage: 1500,
+    tokensPerMediaMinute: 18000,
   ),
   ModelPricing(
     id: 'gpt-4o',
@@ -276,6 +347,9 @@ const List<ModelPricing> kDefaultModelCatalog = [
     outputAboveThresholdPer1M: 20.00,
     cacheWritePer1M: 2.50,
     cacheReadPer1M: 1.25, // 50% discount on cached prefix
+    tokensPerImage: 765, // High-detail tile average
+    tokensPerPdfPage: 1100,
+    tokensPerMediaMinute: 12000,
   ),
   ModelPricing(
     id: 'open-weights-70b',
@@ -292,12 +366,39 @@ const List<ModelPricing> kDefaultModelCatalog = [
     outputAboveThresholdPer1M: 2.20,
     cacheWritePer1M: 0.27,
     cacheReadPer1M: 0.07,
+    tokensPerImage: 512,
+    tokensPerPdfPage: 900,
+    tokensPerMediaMinute: 15000,
   ),
 ];
 
 // ============================================================================
 // SIMULATION RESULT MODEL & ENGINE
 // ============================================================================
+
+class TurnBreakdown {
+  final int turnNumber;
+  final int totalContextTokens;
+  final int uncachedInputTokens;
+  final int cacheWriteTokens;
+  final int cacheReadTokens;
+  final int outputTokens;
+  final int reasoningTokens;
+  final double turnCost;
+  final bool isLongContextTier;
+
+  const TurnBreakdown({
+    required this.turnNumber,
+    required this.totalContextTokens,
+    required this.uncachedInputTokens,
+    required this.cacheWriteTokens,
+    required this.cacheReadTokens,
+    required this.outputTokens,
+    required this.reasoningTokens,
+    required this.turnCost,
+    required this.isLongContextTier,
+  });
+}
 
 class SimulationBreakdown {
   final ModelPricing model;
@@ -306,12 +407,14 @@ class SimulationBreakdown {
   final int multimodalTokens;
   final int initialPromptTokens;
   final int peakTurnContextTokens;
-  final int totalBilledInputTokens;
-  final int totalCachedReadTokens;
+  final int totalBilledInputTokens; // Strictly uncached input tokens
+  final int totalCacheWriteTokens; // Dedicated Turn-1 cache write tokens (Fix 1.3)
+  final int totalCachedReadTokens; // Turn 2..N cache read tokens
   final int totalVisibleOutputTokens;
   final int totalReasoningTokens;
   final bool exceedsContextWindow;
   final bool crossedLongContextTier;
+  final bool textWasTruncated;
 
   final double uncachedInputCost;
   final double cacheWriteCost;
@@ -320,6 +423,8 @@ class SimulationBreakdown {
   final double reasoningOutputCost;
   final double totalCostSingleRun;
   final double uncachedBaselineCost;
+  final double uncachedInputBaselineCost;
+  final List<TurnBreakdown> turns;
 
   const SimulationBreakdown({
     required this.model,
@@ -329,11 +434,13 @@ class SimulationBreakdown {
     required this.initialPromptTokens,
     required this.peakTurnContextTokens,
     required this.totalBilledInputTokens,
+    required this.totalCacheWriteTokens,
     required this.totalCachedReadTokens,
     required this.totalVisibleOutputTokens,
     required this.totalReasoningTokens,
     required this.exceedsContextWindow,
     required this.crossedLongContextTier,
+    required this.textWasTruncated,
     required this.uncachedInputCost,
     required this.cacheWriteCost,
     required this.cacheReadCost,
@@ -341,27 +448,80 @@ class SimulationBreakdown {
     required this.reasoningOutputCost,
     required this.totalCostSingleRun,
     required this.uncachedBaselineCost,
+    required this.uncachedInputBaselineCost,
+    required this.turns,
   });
 
+  /// Positive = Cache Saved X% of input cost.
+  /// Negative = Cache Penalty -X% (Turn-1 write surcharge exceeded Turn 2..N savings).
   double get cacheSavingsPercent {
-    if (uncachedBaselineCost <= 0) return 0;
-    final diff = uncachedBaselineCost - totalCostSingleRun;
-    return diff > 0 ? (diff / uncachedBaselineCost) * 100.0 : 0.0;
+    if (uncachedInputBaselineCost <= 0) return 0.0;
+    final actualInputCost = uncachedInputCost + cacheWriteCost + cacheReadCost;
+    final diff = uncachedInputBaselineCost - actualInputCost;
+    return (diff / uncachedInputBaselineCost) * 100.0;
   }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is SimulationBreakdown &&
+          other.model.id == model.id &&
+          other.totalCostSingleRun == totalCostSingleRun &&
+          other.peakTurnContextTokens == peakTurnContextTokens &&
+          other.totalBilledInputTokens == totalBilledInputTokens &&
+          other.totalCacheWriteTokens == totalCacheWriteTokens &&
+          other.totalCachedReadTokens == totalCachedReadTokens);
+
+  @override
+  int get hashCode => Object.hash(
+        model.id,
+        totalCostSingleRun,
+        peakTurnContextTokens,
+        totalBilledInputTokens,
+        totalCacheWriteTokens,
+        totalCachedReadTokens,
+      );
 }
 
 class TokenizerEngine {
+  static const int maxInputChars = 200000;
+  static const int _maxCacheEntries = 64;
+
+  static final LinkedHashMap<String, int> _countCache =
+      LinkedHashMap<String, int>();
+
+  /// Unicode-aware regex handling:
+  /// 1: Whitespace runs
+  /// 2: Numeric literals
+  /// 3: Multi-char code operators & markdown fences
+  /// 4: ASCII & Latin/Cyrillic identifiers
+  /// 5: CJK ideographs & Hangul syllables
+  /// 6: Emoji / surrogate / astral plane symbols
+  /// 7: Single-char punctuation fallback
   static final RegExp _tokenRegex = RegExp(
-    r'(\s+)|([0-9]+(?:\.[0-9]+)?)|([A-Za-z_][A-Za-z0-9_]*)|([^\sA-Za-z0-9_])',
+    r'(\s+)'
+    r'|([0-9]+(?:\.[0-9]+)?)'
+    r'|(```|===|!==|>>>|<<|>>|->|=>|::|\|\||&&|<=|>=|==|!=|\+\+|--)'
+    r'|([A-Za-z_\u00C0-\u024F\u0400-\u04FF][A-Za-z0-9_\u00C0-\u024F\u0400-\u04FF]*)'
+    r'|([\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF])'
+    r'|([\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}])'
+    r'|([^\sA-Za-z0-9_])',
+    unicode: true,
   );
 
-  /// Content-aware subword tokenizer that splits long identifiers and
-  /// accounts for dense code punctuation vs. natural prose.
+  static String capInput(String text) {
+    if (text.length <= maxInputChars) return text;
+    return text.substring(0, maxInputChars);
+  }
+
+  /// Content-aware subword tokenizer that handles multi-char operators,
+  /// Cyrillic/CJK scripts, and emoji BPE multipliers.
   static List<TokenSpanItem> tokenizeToSpans(
-    String text, {
+    String rawText, {
     double charsPerToken = 3.8,
   }) {
-    if (text.isEmpty) return const [];
+    if (rawText.isEmpty) return const [];
+    final text = capInput(rawText);
     final List<TokenSpanItem> spans = [];
     final matches = _tokenRegex.allMatches(text);
     final int subwordChunk = math.max(3, charsPerToken.round() + 1);
@@ -369,7 +529,6 @@ class TokenizerEngine {
     for (final m in matches) {
       final full = m.group(0)!;
       if (m.group(1) != null) {
-        // Whitespace run: collapses multiple spaces into ~1 token per 4 chars
         if (full.length <= 4) {
           spans.add(TokenSpanItem(full, TokenKind.whitespace));
         } else {
@@ -381,7 +540,6 @@ class TokenizerEngine {
           }
         }
       } else if (m.group(2) != null) {
-        // Numbers: usually 1-3 digits per token
         for (int i = 0; i < full.length; i += 3) {
           spans.add(TokenSpanItem(
             full.substring(i, math.min(i + 3, full.length)),
@@ -389,30 +547,49 @@ class TokenizerEngine {
           ));
         }
       } else if (m.group(3) != null) {
-        // Words / identifiers: split long words into BPE-like subwords
-        if (full.length <= subwordChunk + 2) {
+        // Grouped multi-char operator or code fence = 1 token
+        spans.add(TokenSpanItem(full, TokenKind.codePunct));
+      } else if (m.group(4) != null) {
+        // Cyrillic / non-ASCII words split slightly denser in BPE
+        final bool isNonAscii = full.codeUnits.any((c) => c > 127);
+        final int step = isNonAscii ? math.max(2, subwordChunk - 1) : subwordChunk;
+        if (full.length <= step + 2) {
           spans.add(TokenSpanItem(full, TokenKind.word));
         } else {
-          for (int i = 0; i < full.length; i += subwordChunk) {
+          for (int i = 0; i < full.length; i += step) {
             spans.add(TokenSpanItem(
-              full.substring(i, math.min(i + subwordChunk, full.length)),
+              full.substring(i, math.min(i + step, full.length)),
               TokenKind.word,
             ));
           }
         }
+      } else if (m.group(5) != null) {
+        // CJK character (~1.5 BPE tokens on average; alternate 1 and 2)
+        spans.add(TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: 2));
+      } else if (m.group(6) != null) {
+        // Emoji / astral symbol (~3 BPE tokens per emoji)
+        spans.add(TokenSpanItem(full, TokenKind.emojiOrNonLatin, bpeWeight: 3));
       } else {
-        // Code punctuation / symbols
         spans.add(TokenSpanItem(full, TokenKind.codePunct));
       }
     }
     return spans;
   }
 
-  /// Counts non-whitespace merged subword tokens accurately.
-  static int estimateTokenCount(String text, {double charsPerToken = 3.8}) {
+  /// Memoized token count with an LRU cache keyed on (hashCode, length, charsPerToken).
+  static int estimateTokenCount(String rawText, {double charsPerToken = 3.8}) {
+    final text = capInput(rawText);
     if (text.trim().isEmpty) return 0;
+
+    final String cacheKey =
+        '${text.hashCode}:${text.length}:${charsPerToken.toStringAsFixed(2)}';
+    final int? cached = _countCache.remove(cacheKey);
+    if (cached != null) {
+      _countCache[cacheKey] = cached; // Refresh LRU order
+      return cached;
+    }
+
     final spans = tokenizeToSpans(text, charsPerToken: charsPerToken);
-    // In BPE/SentencePiece, a leading space usually merges with the following word
     int count = 0;
     bool prevWasSpace = false;
     for (final s in spans) {
@@ -422,11 +599,17 @@ class TokenizerEngine {
         }
         prevWasSpace = true;
       } else {
-        count++;
+        count += s.bpeWeight;
         prevWasSpace = false;
       }
     }
-    return math.max(1, count);
+
+    final int result = math.max(1, count);
+    if (_countCache.length >= _maxCacheEntries) {
+      _countCache.remove(_countCache.keys.first);
+    }
+    _countCache[cacheKey] = result;
+    return result;
   }
 }
 
@@ -442,17 +625,23 @@ class EstimatorDashboard extends StatefulWidget {
 }
 
 class _EstimatorDashboardState extends State<EstimatorDashboard> {
-  static const String _prefsCatalogKey = 'custom_pricing_catalog_v1';
-  static const String _prefsLastSyncKey = 'last_pricing_sync_time_v1';
+  static const String _prefsCatalogKey = 'custom_pricing_catalog_v2';
+  static const String _prefsLastSyncKey = 'last_pricing_sync_time_v2';
+  static const int _currentSchemaVersion = 2;
 
   List<ModelPricing> _catalog = List.from(kDefaultModelCatalog);
   late String _selectedModelId;
 
   late final TextEditingController _systemPromptCtrl;
   late final TextEditingController _userPromptCtrl;
+  Timer? _debounceTimer;
+
+  // Track last trimmed text to skip no-op whitespace rebuilds
+  String _debouncedSystemText = '';
+  String _debouncedUserText = '';
 
   ExecutionMode _mode = ExecutionMode.agent;
-  ReasoningEffort _reasoningEffort = ReasoningEffort.medium;
+  ReasoningPreset _reasoningEffort = ReasoningPreset.medium;
 
   // Agent Loop parameters
   int _agentSteps = 6;
@@ -467,9 +656,13 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
 
   // UI view toggles
   bool _showTokenInspector = false;
+  bool _showTurnByTurnTable = false;
   int _batchMultiplier = 1; // 1, 1000, 100000
   bool _isSyncing = false;
   String? _lastSyncStatus;
+
+  // Memoized simulations for current state
+  List<SimulationBreakdown>? _cachedSimulations;
 
   @override
   void initState() {
@@ -489,6 +682,9 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
           '{"service": "teleserver", "maxBatchSize": 128, "retryBackoffMs": [100, 250, 500]}\n'
           '```',
     );
+    _debouncedSystemText = _systemPromptCtrl.text;
+    _debouncedUserText = _userPromptCtrl.text;
+
     _systemPromptCtrl.addListener(_onInputChanged);
     _userPromptCtrl.addListener(_onInputChanged);
     _loadSavedPricingCatalog();
@@ -496,13 +692,34 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
 
   @override
   void dispose() {
+    _debounceTimer?.cancel();
     _systemPromptCtrl.dispose();
     _userPromptCtrl.dispose();
     super.dispose();
   }
 
+  void _invalidateSimulations() {
+    _cachedSimulations = null;
+  }
+
   void _onInputChanged() {
-    if (mounted) setState(() {});
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 180), () {
+      if (!mounted) return;
+      final newSys = _systemPromptCtrl.text;
+      final newUsr = _userPromptCtrl.text;
+      if (newSys.trim() == _debouncedSystemText.trim() &&
+          newUsr.trim() == _debouncedUserText.trim() &&
+          newSys.length == _debouncedSystemText.length &&
+          newUsr.length == _debouncedUserText.length) {
+        return;
+      }
+      setState(() {
+        _debouncedSystemText = newSys;
+        _debouncedUserText = newUsr;
+        _invalidateSimulations();
+      });
+    });
   }
 
   ModelPricing get _activeModel => _catalog.firstWhere(
@@ -510,8 +727,13 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
         orElse: () => _catalog.first,
       );
 
+  List<SimulationBreakdown> _getOrComputeSimulations() {
+    return _cachedSimulations ??=
+        _catalog.map(_simulateForModel).toList(growable: false);
+  }
+
   // --------------------------------------------------------------------------
-  // PERSISTENCE & LIVE OPENROUTER PRICING SYNC
+  // PERSISTENCE (WITH SCHEMA VERSIONING) & LIVE OPENROUTER PRICING SYNC
   // --------------------------------------------------------------------------
 
   Future<void> _loadSavedPricingCatalog() async {
@@ -520,18 +742,29 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
       final savedJson = prefs.getString(_prefsCatalogKey);
       final savedTime = prefs.getString(_prefsLastSyncKey);
       if (savedJson != null && savedJson.isNotEmpty) {
-        final List<dynamic> decoded = jsonDecode(savedJson) as List<dynamic>;
-        final loaded = decoded
-            .map((e) => ModelPricing.fromJson(e as Map<String, dynamic>))
-            .toList();
-        if (loaded.isNotEmpty && mounted) {
-          setState(() {
-            _catalog = loaded;
-            if (!_catalog.any((m) => m.id == _selectedModelId)) {
-              _selectedModelId = _catalog.first.id;
+        final dynamic decoded = jsonDecode(savedJson);
+        if (decoded is Map<String, dynamic>) {
+          final int? schema = (decoded['schema'] as num?)?.toInt();
+          if (schema == _currentSchemaVersion && decoded['models'] is List) {
+            final loaded = (decoded['models'] as List<dynamic>)
+                .map((e) => ModelPricing.fromJson(e as Map<String, dynamic>))
+                .toList();
+            if (loaded.isNotEmpty && mounted) {
+              setState(() {
+                _catalog = loaded;
+                if (!_catalog.any((m) => m.id == _selectedModelId)) {
+                  _selectedModelId = _catalog.first.id;
+                }
+                _lastSyncStatus = savedTime ?? 'Loaded custom local catalog';
+                _invalidateSimulations();
+              });
             }
-            _lastSyncStatus = savedTime ?? 'Loaded custom local catalog';
-          });
+          } else if (mounted) {
+            setState(() {
+              _lastSyncStatus =
+                  'Schema updated to v$_currentSchemaVersion (reset to factory defaults)';
+            });
+          }
         }
       }
     } catch (_) {
@@ -549,11 +782,15 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
         _selectedModelId = _catalog.first.id;
       }
       _lastSyncStatus = statusLabel;
+      _invalidateSimulations();
     });
     try {
       final prefs = await SharedPreferences.getInstance();
-      final encoded = jsonEncode(updated.map((m) => m.toJson()).toList());
-      await prefs.setString(_prefsCatalogKey, encoded);
+      final payload = {
+        'schema': _currentSchemaVersion,
+        'models': updated.map((m) => m.toJson()).toList(),
+      };
+      await prefs.setString(_prefsCatalogKey, jsonEncode(payload));
       await prefs.setString(_prefsLastSyncKey, statusLabel);
     } catch (_) {}
   }
@@ -561,7 +798,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   Future<void> _syncLiveOpenRouterPricing() async {
     setState(() => _isSyncing = true);
     try {
-      final uri = Uri.parse('https://openrouter.ai/api/v1/models');
+      final uri = Uri.parse('[https://openrouter.ai/api/v1/models](https://openrouter.ai/api/v1/models)');
       final response = await http.get(uri).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
@@ -602,6 +839,8 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
 
           if (liveIn != null && liveOut != null) {
             matchedCount++;
+            final bool isAnthropicStyle =
+                slug.startsWith('anthropic/') || localModel.cacheWritePer1M > localModel.inputPer1M;
             return localModel.copyWith(
               contextWindow: liveContext ?? localModel.contextWindow,
               inputPer1M: liveIn,
@@ -609,7 +848,8 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               reasoningOutputPer1M: liveReason ?? liveOut,
               inputAboveThresholdPer1M: liveIn * 2.0,
               outputAboveThresholdPer1M: liveOut * 1.5,
-              cacheWritePer1M: liveCacheWrite ?? liveIn,
+              cacheWritePer1M: liveCacheWrite ??
+                  (isAnthropicStyle ? liveIn * 1.25 : liveIn),
               cacheReadPer1M: liveCacheRead ?? (liveIn * 0.25),
             );
           }
@@ -636,10 +876,13 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
       }
     } catch (e) {
       if (mounted) {
+        final webCorsHint = kIsWeb
+            ? ' On Web, this may be blocked by browser CORS policies; use Schema / JSON to paste rates manually.'
+            : '';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Live sync unreachable ($e). Using cached/local pricing catalog.',
+              'Live sync unreachable ($e). Using local pricing catalog.$webCorsHint',
             ),
             backgroundColor: const Color(0xFFD97706),
           ),
@@ -655,19 +898,23 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   // --------------------------------------------------------------------------
 
   SimulationBreakdown _simulateForModel(ModelPricing model) {
+    final bool truncated =
+        _debouncedSystemText.length > TokenizerEngine.maxInputChars ||
+        _debouncedUserText.length > TokenizerEngine.maxInputChars;
+
     final int sysTokens = TokenizerEngine.estimateTokenCount(
-      _systemPromptCtrl.text,
+      _debouncedSystemText,
       charsPerToken: model.charsPerToken,
     );
     final int usrTokens = TokenizerEngine.estimateTokenCount(
-      _userPromptCtrl.text,
+      _debouncedUserText,
       charsPerToken: model.charsPerToken,
     );
 
-    // Multimodal payload estimation
-    final int imageTokens = _imageCount * 258;
-    final int pdfTokens = _pdfPageCount * 850;
-    final int mediaTokens = _mediaMinutes * 15000; // ~250 tokens/sec
+    // Per-model multimodal payload estimation (Fix 2.2)
+    final int imageTokens = _imageCount * model.tokensPerImage;
+    final int pdfTokens = _pdfPageCount * model.tokensPerPdfPage;
+    final int mediaTokens = _mediaMinutes * model.tokensPerMediaMinute;
     final int multiTokens = imageTokens + pdfTokens + mediaTokens;
 
     final int initialPromptTokens = sysTokens + usrTokens + multiTokens;
@@ -681,6 +928,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
     final int cacheablePrefixTokens = sysTokens + multiTokens;
 
     int totalUncachedInputTokens = 0;
+    int totalCacheWriteTokens = 0;
     int totalCacheReadTokens = 0;
     int peakContextTokens = 0;
     bool crossedLongContext = false;
@@ -691,8 +939,10 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
     double visibleOutputCost = 0.0;
     double reasoningOutputCost = 0.0;
     double uncachedBaselineCost = 0.0;
+    double uncachedInputBaselineCost = 0.0;
 
     int rollingHistoryTokens = usrTokens;
+    final List<TurnBreakdown> turnLog = [];
 
     for (int turn = 1; turn <= steps; turn++) {
       final int turnTotalContext = cacheablePrefixTokens + rollingHistoryTokens;
@@ -700,7 +950,9 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
         peakContextTokens = turnTotalContext;
       }
 
+      // Only trigger tiered pricing if model actually has a distinct tier below max window (Fix 2.3)
       final bool isLongContextTurn =
+          model.longContextThreshold < model.contextWindow &&
           turnTotalContext > model.longContextThreshold;
       if (isLongContextTurn) crossedLongContext = true;
 
@@ -711,41 +963,83 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
           ? model.outputAboveThresholdPer1M
           : model.outputPer1M;
       final double activeReasonRate = isLongContextTurn
-          ? math.max(model.reasoningOutputPer1M, model.outputAboveThresholdPer1M)
+          ? math.max(
+              model.reasoningOutputPer1M,
+              model.outputAboveThresholdPer1M,
+            )
           : model.reasoningOutputPer1M;
 
-      // Baseline cost if caching were OFF
-      uncachedBaselineCost +=
-          (turnTotalContext / 1000000.0) * activeInRate +
-          (outPerStep / 1000000.0) * activeOutRate +
+      final double turnUncachedInputBaseline =
+          (turnTotalContext / 1000000.0) * activeInRate;
+      final double turnOutCost = (outPerStep / 1000000.0) * activeOutRate;
+      final double turnReasonCost =
           (thinkPerStep / 1000000.0) * activeReasonRate;
+
+      uncachedInputBaselineCost += turnUncachedInputBaseline;
+      uncachedBaselineCost +=
+          turnUncachedInputBaseline + turnOutCost + turnReasonCost;
+
+      int turnUncachedTok = 0;
+      int turnCacheWriteTok = 0;
+      int turnCacheReadTok = 0;
+      double turnInputCost = 0.0;
 
       if (_contextCachingEnabled &&
           _mode == ExecutionMode.agent &&
           cacheablePrefixTokens > 0) {
         if (turn == 1) {
-          // Turn 1 writes the static prefix to cache and bills dynamic user tokens normally
-          cacheWriteCost +=
+          // Turn 1 writes the static prefix to cache and bills dynamic user tokens normally (Fix 1.3)
+          final double writeCost =
               (cacheablePrefixTokens / 1000000.0) * model.cacheWritePer1M;
-          uncachedInputCost += (rollingHistoryTokens / 1000000.0) * activeInRate;
-          totalUncachedInputTokens +=
-              cacheablePrefixTokens + rollingHistoryTokens;
+          final double dynCost =
+              (rollingHistoryTokens / 1000000.0) * activeInRate;
+          cacheWriteCost += writeCost;
+          uncachedInputCost += dynCost;
+          turnInputCost = writeCost + dynCost;
+
+          turnCacheWriteTok = cacheablePrefixTokens;
+          turnUncachedTok = rollingHistoryTokens;
+          totalCacheWriteTokens += cacheablePrefixTokens;
+          totalUncachedInputTokens += rollingHistoryTokens;
         } else {
           // Turn 2..N reads the cached prefix at discounted rate + bills growing dynamic history
-          cacheReadCost +=
+          final double readCost =
               (cacheablePrefixTokens / 1000000.0) * model.cacheReadPer1M;
-          uncachedInputCost += (rollingHistoryTokens / 1000000.0) * activeInRate;
+          final double dynCost =
+              (rollingHistoryTokens / 1000000.0) * activeInRate;
+          cacheReadCost += readCost;
+          uncachedInputCost += dynCost;
+          turnInputCost = readCost + dynCost;
+
+          turnCacheReadTok = cacheablePrefixTokens;
+          turnUncachedTok = rollingHistoryTokens;
           totalCacheReadTokens += cacheablePrefixTokens;
           totalUncachedInputTokens += rollingHistoryTokens;
         }
       } else {
         // No context caching
-        uncachedInputCost += (turnTotalContext / 1000000.0) * activeInRate;
+        turnInputCost = turnUncachedInputBaseline;
+        uncachedInputCost += turnInputCost;
+        turnUncachedTok = turnTotalContext;
         totalUncachedInputTokens += turnTotalContext;
       }
 
-      visibleOutputCost += (outPerStep / 1000000.0) * activeOutRate;
-      reasoningOutputCost += (thinkPerStep / 1000000.0) * activeReasonRate;
+      visibleOutputCost += turnOutCost;
+      reasoningOutputCost += turnReasonCost;
+
+      turnLog.add(
+        TurnBreakdown(
+          turnNumber: turn,
+          totalContextTokens: turnTotalContext,
+          uncachedInputTokens: turnUncachedTok,
+          cacheWriteTokens: turnCacheWriteTok,
+          cacheReadTokens: turnCacheReadTok,
+          outputTokens: outPerStep,
+          reasoningTokens: thinkPerStep,
+          turnCost: turnInputCost + turnOutCost + turnReasonCost,
+          isLongContextTier: isLongContextTurn,
+        ),
+      );
 
       // Compound context for the next agent step (prior output + tool observation)
       rollingHistoryTokens += outPerStep + toolStepTokens;
@@ -765,11 +1059,13 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
       initialPromptTokens: initialPromptTokens,
       peakTurnContextTokens: peakContextTokens,
       totalBilledInputTokens: totalUncachedInputTokens,
+      totalCacheWriteTokens: totalCacheWriteTokens,
       totalCachedReadTokens: totalCacheReadTokens,
       totalVisibleOutputTokens: outPerStep * steps,
       totalReasoningTokens: thinkPerStep * steps,
       exceedsContextWindow: peakContextTokens > model.contextWindow,
       crossedLongContextTier: crossedLongContext,
+      textWasTruncated: truncated,
       uncachedInputCost: uncachedInputCost,
       cacheWriteCost: cacheWriteCost,
       cacheReadCost: cacheReadCost,
@@ -777,6 +1073,8 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
       reasoningOutputCost: reasoningOutputCost,
       totalCostSingleRun: totalCostSingleRun,
       uncachedBaselineCost: uncachedBaselineCost,
+      uncachedInputBaselineCost: uncachedInputBaselineCost,
+      turns: turnLog,
     );
   }
 
@@ -785,119 +1083,13 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   // --------------------------------------------------------------------------
 
   void _openPricingSchemaModal() {
-    final jsonController = TextEditingController(
-      text: const JsonEncoder.withIndent('  ')
-          .convert(_catalog.map((m) => m.toJson()).toList()),
-    );
-    String? errorText;
-
     showDialog<void>(
       context: context,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setModalState) {
-            return AlertDialog(
-              backgroundColor: const Color(0xFF111827),
-              title: const Row(
-                children: [
-                  Icon(Icons.schema_outlined, color: Color(0xFF6366F1)),
-                  SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      'Pricing Schema & JSON Override Editor',
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                ],
-              ),
-              content: SizedBox(
-                width: 720,
-                height: 480,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Edit per-1M token rates, long-context thresholds (e.g. 200000), and Turn-1 Cache Write vs. Turn-N Cache Read rates. Changes persist locally via SharedPreferences.',
-                      style: TextStyle(fontSize: 13, color: Color(0xFF9CA3AF)),
-                    ),
-                    const SizedBox(height: 12),
-                    if (errorText != null)
-                      Container(
-                        padding: const EdgeInsets.all(10),
-                        margin: const EdgeInsets.only(bottom: 10),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF7F1D1D),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Text(
-                          errorText!,
-                          style: const TextStyle(
-                            color: Color(0xFFFCA5A5),
-                            fontSize: 12,
-                          ),
-                        ),
-                      ),
-                    Expanded(
-                      child: TextField(
-                        controller: jsonController,
-                        maxLines: null,
-                        expands: true,
-                        style: const TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: 12.5,
-                          color: Color(0xFFE5E7EB),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton.icon(
-                  onPressed: () async {
-                    await _saveCatalogToPrefs(
-                      List.from(kDefaultModelCatalog),
-                      'Reset to factory defaults',
-                    );
-                    if (ctx.mounted) Navigator.of(ctx).pop();
-                  },
-                  icon: const Icon(Icons.restore, size: 18),
-                  label: const Text('Reset Defaults'),
-                ),
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton.icon(
-                  onPressed: () async {
-                    try {
-                      final decoded =
-                          jsonDecode(jsonController.text) as List<dynamic>;
-                      final parsed = decoded
-                          .map((e) =>
-                              ModelPricing.fromJson(e as Map<String, dynamic>))
-                          .toList();
-                      if (parsed.isEmpty) {
-                        throw const FormatException(
-                            'Model catalog cannot be empty.');
-                      }
-                      await _saveCatalogToPrefs(
-                        parsed,
-                        'Saved custom JSON overrides',
-                      );
-                      if (ctx.mounted) Navigator.of(ctx).pop();
-                    } catch (e) {
-                      setModalState(() {
-                        errorText = 'Invalid JSON Schema: $e';
-                      });
-                    }
-                  },
-                  icon: const Icon(Icons.save_outlined, size: 18),
-                  label: const Text('Save & Persist Schema'),
-                ),
-              ],
-            );
-          },
+      builder: (dialogCtx) {
+        return _PricingSchemaDialog(
+          initialCatalog: _catalog,
+          schemaVersion: _currentSchemaVersion,
+          onSaveCatalog: _saveCatalogToPrefs,
         );
       },
     );
@@ -909,8 +1101,11 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
 
   @override
   Widget build(BuildContext context) {
-    final activeSim = _simulateForModel(_activeModel);
-    final allSimulations = _catalog.map(_simulateForModel).toList();
+    final allSimulations = _getOrComputeSimulations();
+    final activeSim = allSimulations.firstWhere(
+      (s) => s.model.id == _selectedModelId,
+      orElse: () => allSimulations.first,
+    );
 
     return Scaffold(
       appBar: _buildAppBar(),
@@ -948,7 +1143,6 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               ),
             );
           } else {
-            // Compact layout for Mobile or Narrow Desktop/Web Windows
             return Column(
               children: [
                 Expanded(
@@ -1006,7 +1200,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                 ),
                 Text(
                   _lastSyncStatus ??
-                      'Tiered Context + Split Cache Write/Read Engine',
+                      'Heuristic BPE Estimator (±15%) • Split Cache Write/Read Engine',
                   style: const TextStyle(
                     fontSize: 11.5,
                     color: Color(0xFF9CA3AF),
@@ -1071,7 +1265,6 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
           alignment: WrapAlignment.spaceBetween,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
-            // Mode Segmented Control
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -1100,14 +1293,15 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                   ],
                   selected: {_mode},
                   onSelectionChanged: (val) {
-                    setState(() => _mode = val.first);
+                    setState(() {
+                      _mode = val.first;
+                      _invalidateSimulations();
+                    });
                   },
                 ),
               ],
             ),
-
-            // Target Model Dropdown
-             ConstrainedBox(
+            ConstrainedBox(
               constraints: const BoxConstraints(minWidth: 270, maxWidth: 360),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1123,6 +1317,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                   ),
                   const SizedBox(height: 8),
                   DropdownButtonFormField<String>(
+                    key: ValueKey(_selectedModelId),
                     initialValue: _selectedModelId,
                     isExpanded: true,
                     decoration: const InputDecoration(
@@ -1156,7 +1351,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
 
   Widget _buildSplitPromptInputsCard(SimulationBreakdown sim) {
     final combinedText =
-        '${_systemPromptCtrl.text}\n${_userPromptCtrl.text}'.trim();
+        '$_debouncedSystemText\n$_debouncedUserText'.trim();
     final spans = _showTokenInspector
         ? TokenizerEngine.tokenizeToSpans(
             combinedText,
@@ -1208,12 +1403,27 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                         _userPromptCtrl.clear();
                       },
                       icon: const Icon(Icons.delete_outline, size: 16),
-                      label: const Text('Clear', style: TextStyle(fontSize: 12)),
+                      label:
+                          const Text('Clear', style: TextStyle(fontSize: 12)),
                     ),
                   ],
                 ),
               ],
             ),
+            if (sim.textWasTruncated)
+              Container(
+                margin: const EdgeInsets.only(top: 10),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF78350F),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Text(
+                  'Input exceeds 200,000 characters — truncated for real-time BPE estimation.',
+                  style: TextStyle(fontSize: 12, color: Color(0xFFFDE68A)),
+                ),
+              ),
             const SizedBox(height: 12),
 
             // System Prompt Pane
@@ -1229,7 +1439,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                   ),
                 ),
                 Text(
-                  '${sim.systemTextTokens} tokens',
+                  '${_formatNumber(sim.systemTextTokens)} tokens',
                   style: const TextStyle(
                     fontSize: 12,
                     fontFamily: 'monospace',
@@ -1264,7 +1474,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                   ),
                 ),
                 Text(
-                  '${sim.userTextTokens} tokens • ${combinedText.length} chars',
+                  '${_formatNumber(sim.userTextTokens)} tokens • ${_formatNumber(combinedText.length)} chars',
                   style: const TextStyle(
                     fontSize: 12,
                     fontFamily: 'monospace',
@@ -1285,7 +1495,6 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               ),
             ),
 
-            // Optional Visual Subword Token Inspector
             if (_showTokenInspector) ...[
               const SizedBox(height: 14),
               Container(
@@ -1308,11 +1517,15 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                         ),
                         _LegendBadge(
                           color: Color(0xFF78350F),
-                          label: 'Code / Punctuation',
+                          label: 'Operator / Punct',
                         ),
                         _LegendBadge(
                           color: Color(0xFF064E3B),
                           label: 'Numeric Literal',
+                        ),
+                        _LegendBadge(
+                          color: Color(0xFF701A75),
+                          label: 'CJK / Emoji (2-3× BPE)',
                         ),
                       ],
                     ),
@@ -1335,6 +1548,8 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                                 bg = const Color(0xFF78350F);
                               case TokenKind.number:
                                 bg = const Color(0xFF064E3B);
+                              case TokenKind.emojiOrNonLatin:
+                                bg = const Color(0xFF701A75);
                               case TokenKind.whitespace:
                                 bg = const Color(0xFF1F2937);
                             }
@@ -1348,7 +1563,9 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                                 borderRadius: BorderRadius.circular(4),
                               ),
                               child: Text(
-                                span.text,
+                                span.bpeWeight > 1
+                                    ? '${span.text} (×${span.bpeWeight})'
+                                    : span.text,
                                 style: const TextStyle(
                                   fontFamily: 'monospace',
                                   fontSize: 11.5,
@@ -1377,10 +1594,14 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 8,
+              runSpacing: 8,
               children: [
                 const Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(Icons.auto_graph, size: 18, color: Color(0xFFF59E0B)),
                     SizedBox(width: 8),
@@ -1408,8 +1629,12 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                       const SizedBox(width: 6),
                       Switch(
                         value: _contextCachingEnabled,
-                        onChanged: (v) =>
-                            setState(() => _contextCachingEnabled = v),
+                        onChanged: (v) {
+                          setState(() {
+                            _contextCachingEnabled = v;
+                            _invalidateSimulations();
+                          });
+                        },
                       ),
                     ],
                   ),
@@ -1417,7 +1642,6 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
             ),
             const SizedBox(height: 12),
 
-            // Reasoning Effort Segmented Control
             const Text(
               'INTERNAL THINKING / REASONING EFFORT (BILLED AT OUTPUT RATE PER STEP)',
               style: TextStyle(
@@ -1427,19 +1651,28 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               ),
             ),
             const SizedBox(height: 8),
-            SegmentedButton<ReasoningEffort>(
-              segments: ReasoningEffort.values.map((effort) {
-                return ButtonSegment<ReasoningEffort>(
-                  value: effort,
-                  label: Text(
-                    effort.label,
-                    style: const TextStyle(fontSize: 12),
-                  ),
+            LayoutBuilder(
+              builder: (context, box) {
+                final bool compactLabels = box.maxWidth < 460;
+                return SegmentedButton<ReasoningPreset>(
+                  showSelectedIcon: !compactLabels,
+                  segments: ReasoningPreset.values.map((effort) {
+                    return ButtonSegment<ReasoningPreset>(
+                      value: effort,
+                      label: Text(
+                        compactLabels ? effort.shortLabel : effort.label,
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    );
+                  }).toList(),
+                  selected: {_reasoningEffort},
+                  onSelectionChanged: (val) {
+                    setState(() {
+                      _reasoningEffort = val.first;
+                      _invalidateSimulations();
+                    });
+                  },
                 );
-              }).toList(),
-              selected: {_reasoningEffort},
-              onSelectionChanged: (val) {
-                setState(() => _reasoningEffort = val.first);
               },
             ),
             const SizedBox(height: 16),
@@ -1452,16 +1685,27 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                 min: 1,
                 max: 25,
                 divisions: 24,
-                onChanged: (v) => setState(() => _agentSteps = v.round()),
+                onChanged: (v) {
+                  setState(() {
+                    _agentSteps = v.round();
+                    _invalidateSimulations();
+                  });
+                },
               ),
               _buildSliderRow(
                 label: 'Avg Tool Observation Payload Added per Step',
-                valueText: '${_toolPayloadTokensPerStep.round()} tokens/step',
+                valueText:
+                    '${_formatNumber(_toolPayloadTokensPerStep.round())} tokens/step',
                 value: _toolPayloadTokensPerStep,
                 min: 0,
                 max: 10000,
                 divisions: 40,
-                onChanged: (v) => setState(() => _toolPayloadTokensPerStep = v),
+                onChanged: (v) {
+                  setState(() {
+                    _toolPayloadTokensPerStep = v;
+                    _invalidateSimulations();
+                  });
+                },
               ),
             ],
 
@@ -1469,13 +1713,18 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               label: isAgent
                   ? 'Visible Model Output per Step'
                   : 'Expected Visible Completion Output',
-              valueText: '${_visibleOutputTokensPerStep.round()} tokens',
+              valueText:
+                  '${_formatNumber(_visibleOutputTokensPerStep.round())} tokens',
               value: _visibleOutputTokensPerStep,
               min: 100,
               max: 8000,
               divisions: 79,
-              onChanged: (v) =>
-                  setState(() => _visibleOutputTokensPerStep = v),
+              onChanged: (v) {
+                setState(() {
+                  _visibleOutputTokensPerStep = v;
+                  _invalidateSimulations();
+                });
+              },
             ),
           ],
         ),
@@ -1499,7 +1748,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(label, style: const TextStyle(fontSize: 13)),
+              Expanded(child: Text(label, style: const TextStyle(fontSize: 13))),
               Text(
                 valueText,
                 style: const TextStyle(
@@ -1524,6 +1773,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   }
 
   Widget _buildMultimodalAttachmentsCard(SimulationBreakdown sim) {
+    final model = sim.model;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -1568,21 +1818,38 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               children: [
                 _buildCounterBox(
                   title: 'Images',
-                  subtitle: '~258 tok / img',
+                  subtitle: '~${_formatNumber(model.tokensPerImage)} tok / img',
                   count: _imageCount,
-                  onChanged: (v) => setState(() => _imageCount = v),
+                  onChanged: (v) {
+                    setState(() {
+                      _imageCount = v;
+                      _invalidateSimulations();
+                    });
+                  },
                 ),
                 _buildCounterBox(
                   title: 'PDF Pages',
-                  subtitle: '~850 tok / page',
+                  subtitle:
+                      '~${_formatNumber(model.tokensPerPdfPage)} tok / page',
                   count: _pdfPageCount,
-                  onChanged: (v) => setState(() => _pdfPageCount = v),
+                  onChanged: (v) {
+                    setState(() {
+                      _pdfPageCount = v;
+                      _invalidateSimulations();
+                    });
+                  },
                 ),
                 _buildCounterBox(
                   title: 'Video / Audio',
-                  subtitle: '~15k tok / min',
+                  subtitle:
+                      '~${_formatNumber(model.tokensPerMediaMinute)} tok / min',
                   count: _mediaMinutes,
-                  onChanged: (v) => setState(() => _mediaMinutes = v),
+                  onChanged: (v) {
+                    setState(() {
+                      _mediaMinutes = v;
+                      _invalidateSimulations();
+                    });
+                  },
                 ),
               ],
             ),
@@ -1599,7 +1866,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
     required ValueChanged<int> onChanged,
   }) {
     return Container(
-      width: 210,
+      width: 215,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: const Color(0xFF0B0F19),
@@ -1658,6 +1925,8 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
 
   Widget _buildRightTelemetryColumn(SimulationBreakdown sim) {
     final scaledCost = sim.totalCostSingleRun * _batchMultiplier;
+    final savingsPct = sim.cacheSavingsPercent;
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(20),
@@ -1667,13 +1936,16 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(
-                  sim.model.name.toUpperCase(),
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 1.0,
-                    color: Color(0xFF818CF8),
+                Expanded(
+                  child: Text(
+                    sim.model.name.toUpperCase(),
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.0,
+                      color: Color(0xFF818CF8),
+                    ),
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
                 Container(
@@ -1719,8 +1991,11 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  Wrap(
+                    alignment: WrapAlignment.spaceBetween,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: 8,
+                    runSpacing: 6,
                     children: [
                       Text(
                         _batchMultiplier == 1
@@ -1732,22 +2007,28 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                           color: Color(0xFFA5B4FC),
                         ),
                       ),
-                      if (sim.cacheSavingsPercent > 0.5)
+                      if (savingsPct.abs() >= 0.5)
                         Container(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 8,
                             vertical: 2,
                           ),
                           decoration: BoxDecoration(
-                            color: const Color(0xFF065F46),
+                            color: savingsPct > 0
+                                ? const Color(0xFF065F46)
+                                : const Color(0xFF7F1D1D),
                             borderRadius: BorderRadius.circular(99),
                           ),
                           child: Text(
-                            'Cache Saved ${sim.cacheSavingsPercent.toStringAsFixed(1)}%',
-                            style: const TextStyle(
+                            savingsPct > 0
+                                ? 'Input Cache Saved ${savingsPct.toStringAsFixed(1)}%'
+                                : 'Cache Penalty +${savingsPct.abs().toStringAsFixed(1)}%',
+                            style: TextStyle(
                               fontSize: 11,
                               fontWeight: FontWeight.bold,
-                              color: Color(0xFF6EE7B7),
+                              color: savingsPct > 0
+                                  ? const Color(0xFF6EE7B7)
+                                  : const Color(0xFFFCA5A5),
                             ),
                           ),
                         ),
@@ -1792,14 +2073,18 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
             const SizedBox(height: 16),
 
             // Batch Scale Selector
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 8,
+              runSpacing: 8,
               children: [
                 const Text(
                   'Batch Projection Scale:',
                   style: TextStyle(fontSize: 12.5, color: Color(0xFF9CA3AF)),
                 ),
                 SegmentedButton<int>(
+                  showSelectedIcon: false,
                   segments: const [
                     ButtonSegment(value: 1, label: Text('1 Run')),
                     ButtonSegment(value: 1000, label: Text('1k Runs')),
@@ -1813,7 +2098,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
             ),
             const Divider(height: 28, color: Color(0xFF1F2937)),
 
-            // Granular Token & Cost Ledger
+            // Granular Token & Cost Ledger (Fix 1.3: separated Turn-1 Write vs Uncached Input)
             const Text(
               'GRANULAR TOKEN & BILLING LEDGER (PER 1 WORKFLOW)',
               style: TextStyle(
@@ -1824,14 +2109,20 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
             ),
             const SizedBox(height: 12),
             _buildLedgerRow(
-              label: 'Uncached Input / Compounding History',
+              label: 'Uncached Dynamic Input & History',
               tokens: '${_formatNumber(sim.totalBilledInputTokens)} tok',
               cost: _formatCurrency(sim.uncachedInputCost),
             ),
             _buildLedgerRow(
-              label: 'Turn-1 Cache Write + Turn-N Cache Reads',
+              label: 'Turn-1 Prefix Cache Write',
+              tokens: '${_formatNumber(sim.totalCacheWriteTokens)} write tok',
+              cost: _formatCurrency(sim.cacheWriteCost),
+              highlightColor: const Color(0xFF38BDF8),
+            ),
+            _buildLedgerRow(
+              label: 'Turn-2..N Prefix Cache Reads',
               tokens: '${_formatNumber(sim.totalCachedReadTokens)} read tok',
-              cost: _formatCurrency(sim.cacheWriteCost + sim.cacheReadCost),
+              cost: _formatCurrency(sim.cacheReadCost),
               highlightColor: const Color(0xFF10B981),
             ),
             _buildLedgerRow(
@@ -1845,6 +2136,39 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               cost: _formatCurrency(sim.reasoningOutputCost),
               highlightColor: const Color(0xFFF59E0B),
             ),
+
+            // Per-Turn Expansion Toggle (Review Question 5)
+            const SizedBox(height: 8),
+            InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () =>
+                  setState(() => _showTurnByTurnTable = !_showTurnByTurnTable),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      'Inspect Compounding Turn-by-Turn Ledger (${sim.turns.length} steps)',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF818CF8),
+                      ),
+                    ),
+                    Icon(
+                      _showTurnByTurnTable
+                          ? Icons.expand_less
+                          : Icons.expand_more,
+                      size: 18,
+                      color: const Color(0xFF818CF8),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_showTurnByTurnTable) _buildTurnByTurnExpansion(sim),
+
             const Divider(height: 24, color: Color(0xFF1F2937)),
 
             // Active Model Rate Card Summary
@@ -1884,26 +2208,88 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
-              onPressed: () {
+              onPressed: () async {
                 final summary =
                     'Model: ${sim.model.name} (${_mode.name.toUpperCase()})\n'
                     'Peak Turn Context: ${_formatNumber(sim.peakTurnContextTokens)} tokens\n'
-                    'Billed Uncached Input: ${_formatNumber(sim.totalBilledInputTokens)} tokens\n'
-                    'Cached Read Hits: ${_formatNumber(sim.totalCachedReadTokens)} tokens\n'
+                    'Uncached Dynamic Input: ${_formatNumber(sim.totalBilledInputTokens)} tokens\n'
+                    'Turn-1 Cache Write: ${_formatNumber(sim.totalCacheWriteTokens)} tokens\n'
+                    'Turn-2..N Cache Reads: ${_formatNumber(sim.totalCachedReadTokens)} tokens\n'
                     'Output + Thinking: ${_formatNumber(sim.totalVisibleOutputTokens + sim.totalReasoningTokens)} tokens\n'
                     'Cost (1 Run): ${_formatCurrency(sim.totalCostSingleRun)}\n'
                     'Cost (${_formatNumber(_batchMultiplier)} Runs): ${_formatCurrency(scaledCost)}';
-                Clipboard.setData(ClipboardData(text: summary));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Copied cost telemetry report to clipboard.'),
-                  ),
-                );
+                try {
+                  await Clipboard.setData(ClipboardData(text: summary));
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content:
+                            Text('Copied cost telemetry report to clipboard.'),
+                      ),
+                    );
+                  }
+                } catch (_) {}
               },
               icon: const Icon(Icons.copy, size: 16),
               label: const Text('Copy Telemetry Report'),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTurnByTurnExpansion(SimulationBreakdown sim) {
+    return Container(
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0B0F19),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFF1F2937)),
+      ),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 210),
+        child: SingleChildScrollView(
+          child: Column(
+            children: sim.turns.map((t) {
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      'Turn ${t.turnNumber}${t.isLongContextTier ? " (Tier+)" : ""}',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontFamily: 'monospace',
+                        fontWeight: FontWeight.w600,
+                        color: t.isLongContextTier
+                            ? const Color(0xFFFBBF24)
+                            : const Color(0xFFD1D5DB),
+                      ),
+                    ),
+                    Text(
+                      'Ctx: ${_formatNumber(t.totalContextTokens)} tok',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                        color: Color(0xFF9CA3AF),
+                      ),
+                    ),
+                    Text(
+                      _formatCurrency(t.turnCost),
+                      style: const TextStyle(
+                        fontSize: 11.5,
+                        fontFamily: 'monospace',
+                        color: Color(0xFF10B981),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
+          ),
         ),
       ),
     );
@@ -2011,10 +2397,21 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                   DataColumn(label: Text('Peak Context')),
                   DataColumn(label: Text('1-Run Cost')),
                   DataColumn(label: Text('Scaled Batch Cost')),
-                  DataColumn(label: Text('Cache Savings')),
+                  DataColumn(label: Text('Input Cache Impact')),
                 ],
                 rows: simulations.map((sim) {
                   final isSelected = sim.model.id == _selectedModelId;
+                  final pct = sim.cacheSavingsPercent;
+                  String cacheLabel = '0%';
+                  Color cacheColor = const Color(0xFF6B7280);
+                  if (pct >= 0.5) {
+                    cacheLabel = '-${pct.toStringAsFixed(1)}%';
+                    cacheColor = const Color(0xFF34D399);
+                  } else if (pct <= -0.5) {
+                    cacheLabel = '+${pct.abs().toStringAsFixed(1)}% penalty';
+                    cacheColor = const Color(0xFFF87171);
+                  }
+
                   return DataRow(
                     selected: isSelected,
                     onSelectChanged: (_) {
@@ -2092,14 +2489,11 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                       ),
                       DataCell(
                         Text(
-                          sim.cacheSavingsPercent > 0.5
-                              ? '-${sim.cacheSavingsPercent.toStringAsFixed(1)}%'
-                              : '0%',
+                          cacheLabel,
                           style: TextStyle(
                             fontFamily: 'monospace',
-                            color: sim.cacheSavingsPercent > 0.5
-                                ? const Color(0xFF34D399)
-                                : const Color(0xFF6B7280),
+                            fontWeight: FontWeight.w600,
+                            color: cacheColor,
                           ),
                         ),
                       ),
@@ -2163,12 +2557,14 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   }
 
   // --------------------------------------------------------------------------
-  // FORMATTING HELPERS
+  // FORMATTING HELPERS (SAFE FOR NEGATIVES & CONSISTENT PRECISION)
   // --------------------------------------------------------------------------
 
   String _formatNumber(int n) {
-    final s = n.toString();
+    final bool isNegative = n < 0;
+    final s = n.abs().toString();
     final buf = StringBuffer();
+    if (isNegative) buf.write('-');
     for (int i = 0; i < s.length; i++) {
       if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
       buf.write(s[i]);
@@ -2177,10 +2573,177 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   }
 
   String _formatCurrency(double val) {
-    if (val == 0) return '\$0.0000';
-    if (val < 0.01) return '\$${val.toStringAsFixed(5)}';
-    if (val < 1.0) return '\$${val.toStringAsFixed(4)}';
-    return '\$${val.toStringAsFixed(2)}';
+    if (val == 0) return '\$0.00';
+    final sign = val < 0 ? '-' : '';
+    final absVal = val.abs();
+    if (absVal < 0.01) return '$sign\$${absVal.toStringAsFixed(5)}';
+    if (absVal < 1.0) return '$sign\$${absVal.toStringAsFixed(4)}';
+    return '$sign\$${absVal.toStringAsFixed(2)}';
+  }
+}
+
+// ============================================================================
+// DEDICATED STATEFUL DIALOG FOR JSON PRICING SCHEMA (FIXES 1.4, 3.2, 4.5)
+// ============================================================================
+
+class _PricingSchemaDialog extends StatefulWidget {
+  final List<ModelPricing> initialCatalog;
+  final int schemaVersion;
+  final Future<void> Function(List<ModelPricing>, String) onSaveCatalog;
+
+  const _PricingSchemaDialog({
+    required this.initialCatalog,
+    required this.schemaVersion,
+    required this.onSaveCatalog,
+  });
+
+  @override
+  State<_PricingSchemaDialog> createState() => _PricingSchemaDialogState();
+}
+
+class _PricingSchemaDialogState extends State<_PricingSchemaDialog> {
+  late final TextEditingController _jsonController;
+  String? _errorText;
+
+  @override
+  void initState() {
+    super.initState();
+    final payload = {
+      'schema': widget.schemaVersion,
+      'models': widget.initialCatalog.map((m) => m.toJson()).toList(),
+    };
+    _jsonController = TextEditingController(
+      text: const JsonEncoder.withIndent('  ').convert(payload),
+    );
+  }
+
+  @override
+  void dispose() {
+    _jsonController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final viewport = MediaQuery.sizeOf(context);
+    final dialogWidth = math.min(720.0, math.max(280.0, viewport.width - 32));
+    final dialogHeight = math.min(480.0, math.max(260.0, viewport.height - 140));
+
+    return AlertDialog(
+      backgroundColor: const Color(0xFF111827),
+      title: const Row(
+        children: [
+          Icon(Icons.schema_outlined, color: Color(0xFF6366F1)),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Pricing Schema & JSON Override Editor',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+      content: SizedBox(
+        width: dialogWidth,
+        height: dialogHeight,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Edit per-1M token rates, multimodal weights, and Turn-1 Cache Write vs. Turn-N Cache Read rates. Changes persist locally with schema versioning.',
+              style: TextStyle(fontSize: 13, color: Color(0xFF9CA3AF)),
+            ),
+            const SizedBox(height: 12),
+            if (_errorText != null)
+              Container(
+                padding: const EdgeInsets.all(10),
+                margin: const EdgeInsets.only(bottom: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF7F1D1D),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  _errorText!,
+                  style: const TextStyle(
+                    color: Color(0xFFFCA5A5),
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            Expanded(
+              child: TextField(
+                controller: _jsonController,
+                maxLines: null,
+                expands: true,
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 12.5,
+                  color: Color(0xFFE5E7EB),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton.icon(
+          onPressed: () async {
+            await widget.onSaveCatalog(
+              List.from(kDefaultModelCatalog),
+              'Reset to factory defaults',
+            );
+            if (context.mounted) Navigator.of(context).pop();
+          },
+          icon: const Icon(Icons.restore, size: 18),
+          label: const Text('Reset Defaults'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton.icon(
+          onPressed: () async {
+            try {
+              final dynamic decoded = jsonDecode(_jsonController.text);
+              List<dynamic> rawList;
+              if (decoded is Map<String, dynamic>) {
+                final schema = (decoded['schema'] as num?)?.toInt();
+                if (schema != null && schema != widget.schemaVersion) {
+                  throw FormatException(
+                    'Unsupported schema version $schema (expected ${widget.schemaVersion}).',
+                  );
+                }
+                rawList = (decoded['models'] as List<dynamic>?) ?? [];
+              } else if (decoded is List<dynamic>) {
+                rawList = decoded;
+              } else {
+                throw const FormatException(
+                  'Expected top-level schema object or list of models.',
+                );
+              }
+
+              final parsed = rawList
+                  .map((e) => ModelPricing.fromJson(e as Map<String, dynamic>))
+                  .toList();
+              if (parsed.isEmpty) {
+                throw const FormatException('Model catalog cannot be empty.');
+              }
+              await widget.onSaveCatalog(
+                parsed,
+                'Saved custom JSON overrides (schema v${widget.schemaVersion})',
+              );
+              if (context.mounted) Navigator.of(context).pop();
+            } catch (e) {
+              setState(() {
+                _errorText = 'Invalid JSON Schema: $e';
+              });
+            }
+          },
+          icon: const Icon(Icons.save_outlined, size: 18),
+          label: const Text('Save & Persist Schema'),
+        ),
+      ],
+    );
   }
 }
 
