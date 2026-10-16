@@ -1,6 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
 // Update 'token_estimator' below to match the `name:` field in your pubspec.yaml
-import 'package:token_estimator/main.dart';
+import 'package:token_estimator/data/catalog_repository.dart';
+import 'package:token_estimator/engine/simulator.dart';
+import 'package:token_estimator/engine/tokenizer.dart';
+import 'package:token_estimator/pricing/model_pricing.dart';
 
 void main() {
   const engine = SimulationEngine();
