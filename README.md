@@ -1,14 +1,13 @@
-# **token_estimator**
-### *Wǔxíng Suànmín*
+# **五行算缗**
 **AI Token & Agent Loop Cost Simulator**
 
-![App Preview](https://github.com/rickbeacham/token_estimator/blob/f300a03deb903c9af92b763a4c3a49f7dafb1d88/screenshot-chrome-build.jpg)
+
 ![App Preview](https://cdn.jsdelivr.net/gh/rickbeacham/token_estimator@main/screenshot-chrome-build.jpg)
 
 ---
 
 ## **Overview**
-**五行算缗 (Wǔxíng Suànmín)** is a cyclical cost-tracking system designed to simulate AI token consumption and agent loop expenses. This tool helps developers, researchers, and businesses estimate costs for AI-driven workflows, including multi-turn agent interactions, multimodal inputs, and reasoning effort.
+**五行算缗 - (Wǔxíng Suànmín)** is a cyclical cost-tracking system designed to simulate AI token consumption and agent loop expenses. This tool helps developers, researchers, and businesses estimate costs for AI-driven workflows, including multi-turn agent interactions, multimodal inputs, and reasoning effort.
 
 ---
 
@@ -224,20 +223,58 @@
 
 ---
 
-## **Summary by Category**
+## Key Features
 
-| **Category**               | **Count** |
-|----------------------------|----------|
-| Input modes                | 2        |
-| Preset models              | 5        |
-| Reasoning levels           | 4        |
-| Multimodal input types     | 3        |
-| Batch scales               | 3        |
-| Comparison columns         | 7        |
-| Ledger rows               | 4        |
-| Persistence keys           | 2        |
-| External integrations      | 1 (OpenRouter) |
-| Modal editors              | 1        |
+* **Dual Execution Architectures**: Toggle between single-turn **Chat (1-Turn)** completions and multi-step **Task / Agent Loop** workflows where tool observations and model outputs compound across turns.
+* **Split Context Caching Engine**: Models the real-world economics of prefix caching by separating **Turn-1 Cache Write** creation rates (including provider-specific write surcharges) from **Turn-2..N Cache Read** discounts. Automatically flags when short loops result in a net **Cache Penalty** vs. **Cache Savings**.
+* **Tiered Long-Context Billing**: Tracks compounding context growth turn-by-turn and automatically switches to premium above-threshold input/output rates (e.g., `>200k` tokens) on the exact step the threshold is crossed[cite: 1].
+* **Internal Thinking / Reasoning Budgets**: Simulates hidden chain-of-thought token consumption (`Off`, `Low +1k`, `Med +4k`, `High +16k`) billed at model-specific reasoning output rates on every agent turn[cite: 1].
+* **Per-Model Multimodal Calculators**: Estimates token overhead for attached images, PDF pages, and audio/video minutes using provider-specific multimodal token weights.
+* **Unicode & Code-Aware BPE Heuristic Tokenizer**:
+  * Groups multi-character code operators (`===`, `!==`, `>>>`, `->`, `=>`, `::`, `&&`, `||`) and Markdown code fences (` ``` `) as single tokens.
+  * Supports Latin, Cyrillic, CJK ideographs, Hangul syllables, and composite Emoji ZWJ / flag sequences with realistic BPE token multipliers.
+  * Includes an interactive **Visual Subword Token Inspector** with color-coded token badges[cite: 1].
+  * Built-in 64-entry LRU cache, `180ms` input debouncing, and UTF-16 surrogate-safe truncation at `200,000` characters for zero-stutter performance on large pastes.
+* **Live OpenRouter Sync & Versioned JSON Schema Editor**:
+  * One-click synchronization with the live [OpenRouter Models API](https://openrouter.ai/api/v1/models)[cite: 1].
+  * Built-in JSON Schema Override modal backed by `SharedPreferences` with envelope schema versioning (`schema: 2`)[cite: 1].
+* **Side-by-Side Frontier Comparison Matrix**: Compare peak context, single-run cost, scaled batch projections (`1x`, `1,000x`, `100,000x`), and signed input cache impact across all configured models simultaneously[cite: 1].
+
+---
+
+## Default Frontier Model Catalog
+
+| Model Preset | Provider | Max Context | Long-Context Tier | Base In / Out (1M) | Cache Write / Read (1M) | Image Weight |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Gemini 4 Argon** | Google | 1,000,000[cite: 1] | > 200,000[cite: 1] | $1.25 / $10.00[cite: 1] | $1.25 / $0.310[cite: 1] | 258 tok[cite: 1] |
+| **Gemini 3.x Flash** | Google | 1,000,000[cite: 1] | > 200,000[cite: 1] | $0.15 / $0.60[cite: 1] | $0.15 / $0.038[cite: 1] | 258 tok[cite: 1] |
+| **Claude Sonnet (Frontier)** | Anthropic | 200,000[cite: 1] | > 200,000[cite: 1] | $3.00 / $15.00[cite: 1] | $3.75 / $0.300[cite: 1] | 1,600 tok |
+| **GPT-4o / Frontier** | OpenAI | 128,000[cite: 1] | > 128,000[cite: 1] | $2.50 / $10.00[cite: 1] | $2.50 / $1.250[cite: 1] | 765 tok |
+| **Llama / DeepSeek (Open Weights)** | Open / Cloud | 128,000[cite: 1] | > 128,000[cite: 1] | $0.27 / $1.10[cite: 1] | $0.27 / $0.070[cite: 1] | 512 tok |
+
+*(All rates and thresholds can be customized in-app via the **Schema / JSON** editor or updated via **Sync Live Rates**[cite: 1].)*
+
+---
+
+## Project Architecture
+
+```text
+lib/
+├── main.dart                          # App entry point, dark theme, and module re-exports
+├── pricing/
+│   └── model_pricing.dart             # ModelPricing, ReasoningPreset, ExecutionMode, default catalog
+├── engine/
+│   ├── tokenizer.dart                 # TokenizerEngine (Unicode/BPE regex, LRU cache, surrogate-safe cap)
+│   └── simulator.dart                 # SimulationEngine, SimulationRequest, SimulationBreakdown, TurnBreakdown
+├── data/
+│   └── catalog_repository.dart        # SharedPreferences persistence (schema v2) & OpenRouter API client
+└── ui/
+    ├── dashboard_screen.dart          # Main responsive split-pane simulator & telemetry dashboard
+    └── widgets/
+        ├── legend_badge.dart          # Token inspector legend badges
+        └── pricing_schema_dialog.dart # Stateful, viewport-safe JSON schema override modal
+test/
+└── engine_test.dart                   # Unit & regression tests for tokenizer, URI safety, and cache math
 
 ---
 
@@ -251,8 +288,6 @@
 ❌ No **comparison against historical saved runs**.
 ❌ No **i18n / locale formatting** (currency hard-coded to $).
 ❌ No **dark/light toggle** (dark mode only).
-❌ No **test coverage** (no `test/` folder).
-
 ---
 
 ## **Installation & Usage**
