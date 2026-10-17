@@ -18,10 +18,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Debug Flutter release manifest
+        run: |
+          echo "Fetching Flutter releases manifest..."
+          curl -fsS https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json | head -c 200 || echo "Failed to fetch manifest"
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: 'stable'
+          flutter-version: '3.47.7'
+          channel: 'stable'
 
       - name: Install dependencies
         run: flutter pub get
