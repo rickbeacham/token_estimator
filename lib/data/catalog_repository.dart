@@ -44,7 +44,7 @@ class CatalogRepository {
   final http.Client _httpClient;
 
   CatalogRepository({http.Client? httpClient})
-      : _httpClient = httpClient ?? http.Client();
+    : _httpClient = httpClient ?? http.Client();
 
   Future<CatalogLoadResult> loadSavedCatalog() async {
     try {

@@ -8,4 +8,4 @@ void main() {
     // Verify that the simulator dashboard header renders
     expect(find.text('AI Token & Agent Loop Cost Simulator'), findsOneWidget);
   });
-} 
+}

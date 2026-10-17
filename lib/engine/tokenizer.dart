@@ -83,19 +83,23 @@ class TokenizerEngine {
           spans.add(TokenSpanItem(full, TokenKind.whitespace));
         } else {
           for (int i = 0; i < full.length; i += 4) {
-            spans.add(TokenSpanItem(
-              full.substring(i, math.min(i + 4, full.length)),
-              TokenKind.whitespace,
-            ));
+            spans.add(
+              TokenSpanItem(
+                full.substring(i, math.min(i + 4, full.length)),
+                TokenKind.whitespace,
+              ),
+            );
           }
         }
       } else if (m.group(2) != null) {
         // Numbers: usually 1-3 digits per token
         for (int i = 0; i < full.length; i += 3) {
-          spans.add(TokenSpanItem(
-            full.substring(i, math.min(i + 3, full.length)),
-            TokenKind.number,
-          ));
+          spans.add(
+            TokenSpanItem(
+              full.substring(i, math.min(i + 3, full.length)),
+              TokenKind.number,
+            ),
+          );
         }
       } else if (m.group(3) != null) {
         // Grouped multi-char operator or code fence = 1 token
@@ -104,16 +108,19 @@ class TokenizerEngine {
         // Words / identifiers: split long words into BPE-like subwords
         // Cyrillic / non-ASCII words split slightly denser in BPE
         final bool isNonAscii = full.codeUnits.any((c) => c > 127);
-        final int step =
-            isNonAscii ? math.max(2, subwordChunk - 1) : subwordChunk;
+        final int step = isNonAscii
+            ? math.max(2, subwordChunk - 1)
+            : subwordChunk;
         if (full.length <= step + 2) {
           spans.add(TokenSpanItem(full, TokenKind.word));
         } else {
           for (int i = 0; i < full.length; i += step) {
-            spans.add(TokenSpanItem(
-              full.substring(i, math.min(i + step, full.length)),
-              TokenKind.word,
-            ));
+            spans.add(
+              TokenSpanItem(
+                full.substring(i, math.min(i + step, full.length)),
+                TokenKind.word,
+              ),
+            );
           }
         }
       } else if (m.group(5) != null) {

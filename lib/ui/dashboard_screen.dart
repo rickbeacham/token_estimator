@@ -118,9 +118,9 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
   }
 
   ModelPricing get _activeModel => _catalog.firstWhere(
-        (m) => m.id == _selectedModelId,
-        orElse: () => _catalog.first,
-      );
+    (m) => m.id == _selectedModelId,
+    orElse: () => _catalog.first,
+  );
 
   SimulationRequest _buildRequestForModel(ModelPricing model) {
     return SimulationRequest(
@@ -342,8 +342,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                   overflow: TextOverflow.ellipsis,
                 ),
                 Text(
-                  _lastSyncStatus ??
-                      'Heuristic BPE Estimator (±15%) • Split Cache Write/Read Engine',
+                  _lastSyncStatus ?? 'Heuristic BPE Estimator (±15%) • Split Cache Write/Read Engine',
                   style: const TextStyle(
                     fontSize: 11.5,
                     color: Color(0xFF9CA3AF),
@@ -548,8 +547,10 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                         _userPromptCtrl.clear();
                       },
                       icon: const Icon(Icons.delete_outline, size: 16),
-                      label:
-                          const Text('Clear', style: TextStyle(fontSize: 12)),
+                      label: const Text(
+                        'Clear',
+                        style: TextStyle(fontSize: 12),
+                      ),
                     ),
                   ],
                 ),
@@ -558,8 +559,10 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
             if (sim.textWasTruncated)
               Container(
                 margin: const EdgeInsets.only(top: 10),
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   color: const Color(0xFF78350F),
                   borderRadius: BorderRadius.circular(8),
@@ -600,8 +603,7 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
               maxLines: 5,
               style: const TextStyle(fontSize: 13.5, height: 1.4),
               decoration: const InputDecoration(
-                hintText:
-                    'Paste system prompt, tool definitions, or few-shot examples eligible for prefix caching...',
+                hintText: 'Paste system prompt, tool definitions, or few-shot examples eligible for prefix caching...',
               ),
             ),
             const SizedBox(height: 14),
@@ -686,39 +688,40 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                               .where((s) => s.kind != TokenKind.whitespace)
                               .take(400)
                               .map((span) {
-                            Color bg;
-                            switch (span.kind) {
-                              case TokenKind.word:
-                                bg = const Color(0xFF312E81);
-                              case TokenKind.codePunct:
-                                bg = const Color(0xFF78350F);
-                              case TokenKind.number:
-                                bg = const Color(0xFF064E3B);
-                              case TokenKind.emojiOrNonLatin:
-                                bg = const Color(0xFF701A75);
-                              case TokenKind.whitespace:
-                                bg = const Color(0xFF1F2937);
-                            }
-                            return Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 5,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: bg,
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                span.bpeWeight > 1
-                                    ? '${span.text} (×${span.bpeWeight})'
-                                    : span.text,
-                                style: const TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 11.5,
-                                ),
-                              ),
-                            );
-                          }).toList(),
+                                Color bg;
+                                switch (span.kind) {
+                                  case TokenKind.word:
+                                    bg = const Color(0xFF312E81);
+                                  case TokenKind.codePunct:
+                                    bg = const Color(0xFF78350F);
+                                  case TokenKind.number:
+                                    bg = const Color(0xFF064E3B);
+                                  case TokenKind.emojiOrNonLatin:
+                                    bg = const Color(0xFF701A75);
+                                  case TokenKind.whitespace:
+                                    bg = const Color(0xFF1F2937);
+                                }
+                                return Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: bg,
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    span.bpeWeight > 1
+                                        ? '${span.text} (×${span.bpeWeight})'
+                                        : span.text,
+                                    style: const TextStyle(
+                                      fontFamily: 'monospace',
+                                      fontSize: 11.5,
+                                    ),
+                                  ),
+                                );
+                              })
+                              .toList(),
                         ),
                       ),
                     ),
@@ -895,7 +898,9 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Expanded(child: Text(label, style: const TextStyle(fontSize: 13))),
+              Expanded(
+                child: Text(label, style: const TextStyle(fontSize: 13)),
+              ),
               Text(
                 valueText,
                 style: const TextStyle(
@@ -1370,8 +1375,9 @@ class _EstimatorDashboardState extends State<EstimatorDashboard> {
                   if (mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
-                        content:
-                            Text('Copied cost telemetry report to clipboard.'),
+                        content: Text(
+                          'Copied cost telemetry report to clipboard.',
+                        ),
                       ),
                     );
                   }

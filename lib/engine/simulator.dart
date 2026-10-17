@@ -90,19 +90,19 @@ class SimulationRequest {
 
   @override
   int get hashCode => Object.hash(
-        model.id,
-        systemText,
-        userText,
-        mode,
-        reasoningEffort,
-        agentSteps,
-        toolPayloadTokensPerStep,
-        visibleOutputTokensPerStep,
-        contextCachingEnabled,
-        imageCount,
-        pdfPageCount,
-        mediaMinutes,
-      );
+    model.id,
+    systemText,
+    userText,
+    mode,
+    reasoningEffort,
+    agentSteps,
+    toolPayloadTokensPerStep,
+    visibleOutputTokensPerStep,
+    contextCachingEnabled,
+    imageCount,
+    pdfPageCount,
+    mediaMinutes,
+  );
 }
 
 class TurnBreakdown {
@@ -208,21 +208,19 @@ class SimulationBreakdown {
 
   @override
   int get hashCode => Object.hash(
-        model.id,
-        totalCostSingleRun,
-        peakTurnContextTokens,
-        totalBilledInputTokens,
-        totalCacheWriteTokens,
-        totalCachedReadTokens,
-      );
+    model.id,
+    totalCostSingleRun,
+    peakTurnContextTokens,
+    totalBilledInputTokens,
+    totalCacheWriteTokens,
+    totalCachedReadTokens,
+  );
 }
 
 class SimulationEngine {
   final TokenizerFn tokenizer;
 
-  const SimulationEngine({
-    this.tokenizer = TokenizerEngine.estimateTokenCount,
-  });
+  const SimulationEngine({this.tokenizer = TokenizerEngine.estimateTokenCount});
 
   // --------------------------------------------------------------------------
   // EXACT TURN-BY-TURN AGENT & CHAT SIMULATION ENGINE
@@ -251,8 +249,9 @@ class SimulationEngine {
 
     final int initialPromptTokens = sysTokens + usrTokens + multiTokens;
     final int steps = req.mode == ExecutionMode.chat ? 1 : req.agentSteps;
-    final int toolStepTokens =
-        req.mode == ExecutionMode.chat ? 0 : req.toolPayloadTokensPerStep;
+    final int toolStepTokens = req.mode == ExecutionMode.chat
+        ? 0
+        : req.toolPayloadTokensPerStep;
     final int outPerStep = req.visibleOutputTokensPerStep;
     final int thinkPerStep = req.reasoningEffort.tokenBudget;
 
@@ -378,7 +377,8 @@ class SimulationEngine {
       rollingHistoryTokens += outPerStep + toolStepTokens;
     }
 
-    final double totalCostSingleRun = uncachedInputCost +
+    final double totalCostSingleRun =
+        uncachedInputCost +
         cacheWriteCost +
         cacheReadCost +
         visibleOutputCost +

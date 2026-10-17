@@ -46,8 +46,7 @@ class ReasoningPreset {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      (other is ReasoningPreset && other.id == id);
+      identical(this, other) || (other is ReasoningPreset && other.id == id);
 
   @override
   int get hashCode => id.hashCode;
@@ -141,24 +140,24 @@ class ModelPricing {
   }
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
-        'provider': provider,
-        'openRouterSlug': openRouterSlug,
-        'contextWindow': contextWindow,
-        'charsPerToken': charsPerToken,
-        'inputPer1M': inputPer1M,
-        'outputPer1M': outputPer1M,
-        'reasoningOutputPer1M': reasoningOutputPer1M,
-        'longContextThreshold': longContextThreshold,
-        'inputAboveThresholdPer1M': inputAboveThresholdPer1M,
-        'outputAboveThresholdPer1M': outputAboveThresholdPer1M,
-        'cacheWritePer1M': cacheWritePer1M,
-        'cacheReadPer1M': cacheReadPer1M,
-        'tokensPerImage': tokensPerImage,
-        'tokensPerPdfPage': tokensPerPdfPage,
-        'tokensPerMediaMinute': tokensPerMediaMinute,
-      };
+    'id': id,
+    'name': name,
+    'provider': provider,
+    'openRouterSlug': openRouterSlug,
+    'contextWindow': contextWindow,
+    'charsPerToken': charsPerToken,
+    'inputPer1M': inputPer1M,
+    'outputPer1M': outputPer1M,
+    'reasoningOutputPer1M': reasoningOutputPer1M,
+    'longContextThreshold': longContextThreshold,
+    'inputAboveThresholdPer1M': inputAboveThresholdPer1M,
+    'outputAboveThresholdPer1M': outputAboveThresholdPer1M,
+    'cacheWritePer1M': cacheWritePer1M,
+    'cacheReadPer1M': cacheReadPer1M,
+    'tokensPerImage': tokensPerImage,
+    'tokensPerPdfPage': tokensPerPdfPage,
+    'tokensPerMediaMinute': tokensPerMediaMinute,
+  };
 
   factory ModelPricing.fromJson(Map<String, dynamic> json) {
     final double inBase = (json['inputPer1M'] as num?)?.toDouble() ?? 2.0;
@@ -180,7 +179,7 @@ class ModelPricing {
           (json['inputAboveThresholdPer1M'] as num?)?.toDouble() ?? inBase * 2,
       outputAboveThresholdPer1M:
           (json['outputAboveThresholdPer1M'] as num?)?.toDouble() ??
-              outBase * 2,
+          outBase * 2,
       cacheWritePer1M:
           (json['cacheWritePer1M'] as num?)?.toDouble() ?? inBase * 1.25,
       cacheReadPer1M:
