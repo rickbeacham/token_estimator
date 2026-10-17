@@ -1,0 +1,39 @@
+name: Auto Format (create PR)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *' # optional
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  format-and-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 'stable'
+
+      - name: Run dart/Flutter format
+        run: |
+          flutter format .
+
+      - name: Create pull request with formatting changes
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: apply dart format [skip ci]"
+          branch: "auto/format-${{ github.run_id }}"
+          title: "chore: apply dart format"
+          body: "This PR was created automatically to apply dart/Flutter formatting."
+          labels: "auto-format"
